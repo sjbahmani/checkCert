@@ -55,7 +55,7 @@ government sites, plus `google.com` as a non-Iranian baseline:
 messages are written to standard error. This makes it suitable for monitoring:
 
 ```json
-{"host":"example.com","port":443,"trust":"TRUSTED","revocation":"NOT REVOKED","expiry":"NOT EXPIRED","expiry_days_left":46,"intermediate_revoked":false,"stapled_ocsp":"NOT STAPLED","overall":"VALID","exit_code":0,"warnings":[]}
+{"host":"example.com","port":443,"issuer":"WR2","trust":"TRUSTED","revocation":"NOT REVOKED","expiry":"NOT EXPIRED","expiry_days_left":46,"intermediate_revoked":false,"stapled_ocsp":"NOT STAPLED","overall":"VALID","exit_code":0,"warnings":[]}
 ```
 
 ## Batch mode
@@ -87,16 +87,17 @@ lines in `--json` mode, however, are written in *completion* order, not
 input order, since they stream live as each host finishes). After the
 per-host reports, `BATCH SUMMARY` groups every host by outcome — problems
 first (`REVOKED`, `EXPIRED`, `UNTRUSTED/INVALID`, `ERROR`, `UNKNOWN`), then
-`VALID` — each with a plain-language reason instead of a bare exit code:
+`VALID` — each line naming the immediate issuing CA before a plain-language
+reason instead of a bare exit code:
 
 ```text
 BATCH SUMMARY (4 host(s) checked)
 
 REVOKED (1)
-  bmi.ir:443: leaf certificate is revoked
+  bmi.ir:443 [issuer: Certum OV TLS G2 R39 CA]: leaf certificate is revoked
 
 VALID (3)
-  example.com:443: trusted, not revoked, not expiring soon
+  example.com:443 [issuer: WR2]: trusted, not revoked, not expiring soon
   ...
 ```
 
@@ -179,6 +180,7 @@ Every completed check ends with this machine-readable, uppercase summary:
 
 ```text
 FINAL STATUS
+  ISSUER: <immediate issuing CA's common name, or "unknown">
   TRUST: TRUSTED | UNTRUSTED/INVALID
   REVOCATION: NOT REVOKED | REVOKED | UNKNOWN
   EXPIRY: NOT EXPIRED | EXPIRING SOON | EXPIRED

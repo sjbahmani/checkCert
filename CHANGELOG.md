@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.6.0
+
+- `FINAL STATUS` and `BATCH SUMMARY` now name the immediate issuing intermediate CA (its common name) before the leaf's own trust/revocation/expiry status, e.g. `ISSUER: Certum OV TLS G2 R39 CA` / `bmi.ir:443 [issuer: Certum OV TLS G2 R39 CA]: leaf certificate is revoked`. Added a matching `"issuer"` field to JSON output (`null` for hosts that never connected).
+
 ## 1.5.0
 
 - `--hosts-file` now checks hosts concurrently by default: new `--parallel N` (default 6, requires Bash 4.3+); `--parallel 1` restores strictly sequential, streaming-as-it-runs behavior. Per-host output stays in input-file order regardless; NDJSON lines in `--json` mode are written in completion order.

@@ -9,7 +9,7 @@
 
 set -u -o pipefail
 
-VERSION=1.5.0
+VERSION=1.6.0
 verify_peer=1
 ca_file=
 ca_path=
@@ -201,8 +201,9 @@ emit_error_json() {
     local err_domain=$1 err_port=$2 message=$3
     batch_overall=ERROR
     batch_reason=$message
+    batch_issuer=
     [[ "$output_format" == json ]] || return 0
-    printf '{"host":"%s","port":%s,"trust":null,"revocation":null,"expiry":null,"expiry_days_left":null,"intermediate_revoked":null,"stapled_ocsp":null,"overall":"ERROR","exit_code":3,"warnings":[],"error":"%s"}\n' \
+    printf '{"host":"%s","port":%s,"issuer":null,"trust":null,"revocation":null,"expiry":null,"expiry_days_left":null,"intermediate_revoked":null,"stapled_ocsp":null,"overall":"ERROR","exit_code":3,"warnings":[],"error":"%s"}\n' \
         "$(json_escape "$err_domain")" "$err_port" "$(json_escape "$message")" >&3
 }
 
@@ -361,7 +362,7 @@ check_host() {
     local negotiated_protocol negotiated_cipher
     local leaf_text sig_alg pubkey_algo pubkey_bits key_usage_text
     local certificate_expired expiry_warning expiry_days_left end_date end_epoch
-    local leaf_issuer issuer_cert
+    local leaf_issuer issuer_cert issuer_cn
     local -a issuer_urls=()
     local index issuer_download issuer_candidate
     local chain_bundle
@@ -547,6 +548,13 @@ check_host() {
         done
     fi
     [[ -n "$issuer_cert" ]] || echo "Warning: issuer certificate unavailable; CRL signatures cannot be verified." >&2
+
+    issuer_cn=
+    if [[ -n "$issuer_cert" ]]; then
+        issuer_cn=$(openssl x509 -in "$issuer_cert" -noout -subject -nameopt multiline 2>/dev/null \
+            | awk -F'= *' '/commonName/{print $2; exit}')
+    fi
+    batch_issuer=$issuer_cn
 
     find_presented_issuer() {
         local child=$1 expected_issuer=$2 candidate candidate_subject
@@ -792,14 +800,15 @@ check_host() {
             warnings_json+="\"$(json_escape "${warnings[$index]}")\""
         done
         warnings_json+=']'
-        printf '{"host":"%s","port":%s,"trust":"%s","revocation":"%s","expiry":"%s","expiry_days_left":%s,"intermediate_revoked":%s,"stapled_ocsp":"%s","overall":"%s","exit_code":%s,"warnings":%s}\n' \
-            "$(json_escape "$domain")" "$port" "$(json_escape "$trust_status")" \
+        printf '{"host":"%s","port":%s,"issuer":"%s","trust":"%s","revocation":"%s","expiry":"%s","expiry_days_left":%s,"intermediate_revoked":%s,"stapled_ocsp":"%s","overall":"%s","exit_code":%s,"warnings":%s}\n' \
+            "$(json_escape "$domain")" "$port" "$(json_escape "$issuer_cn")" "$(json_escape "$trust_status")" \
             "$(json_escape "$revocation_status")" "$(json_escape "$expiry_status")" \
             "${expiry_days_left:-null}" \
             "$(if (( intermediate_revoked == 1 )); then echo true; else echo false; fi)" \
             "$(json_escape "$stapled_ocsp")" "$(json_escape "$overall_status")" "$exit_code" "$warnings_json" >&3
     else
         echo "FINAL STATUS"
+        printf '  ISSUER: %s\n' "${issuer_cn:-unknown}"
         printf '  TRUST: %s\n' "$trust_status"
         printf '  REVOCATION: %s\n' "$revocation_status"
         printf '  EXPIRY: %s\n' "$expiry_status"
@@ -823,9 +832,9 @@ if [[ -n "$hosts_file" ]]; then
     declare -a batch_group_order=()
 
     record_batch_result() {
-        local h=$1 p=$2 rc=$3 overall=${4:-UNKNOWN} reason=${5:-"no reason recorded"}
+        local h=$1 p=$2 rc=$3 overall=${4:-UNKNOWN} reason=${5:-"no reason recorded"} issuer=${6:-}
         [[ -n "${batch_group_lines[$overall]+x}" ]] || batch_group_order+=("$overall")
-        batch_group_lines["$overall"]+="  ${h}:${p}: ${reason}"$'\n'
+        batch_group_lines["$overall"]+="  ${h}:${p} [issuer: ${issuer:-unknown}]: ${reason}"$'\n'
         (( rc != 0 )) && batch_worst=1
     }
 
@@ -839,9 +848,10 @@ if [[ -n "$hosts_file" ]]; then
             echo "############################################################"
             batch_overall=
             batch_reason=
+            batch_issuer=
             check_host "$batch_host" "$batch_port"
             batch_rc=$?
-            record_batch_result "$batch_host" "$batch_port" "$batch_rc" "$batch_overall" "$batch_reason"
+            record_batch_result "$batch_host" "$batch_port" "$batch_rc" "$batch_overall" "$batch_reason" "$batch_issuer"
         done
     else
         declare -a job_logs=() job_results=() active_pids=() active_idx=()
@@ -858,9 +868,10 @@ if [[ -n "$hosts_file" ]]; then
                     echo "############################################################"
                     batch_overall=
                     batch_reason=
+                    batch_issuer=
                     check_host "$batch_host" "$batch_port"
                     batch_rc=$?
-                    printf '%s\t%s\t%s\n' "$batch_rc" "$batch_overall" "$batch_reason" > "${job_results[$job_idx]}"
+                    printf '%s\t%s\t%s\t%s\n' "$batch_rc" "$batch_overall" "$batch_reason" "$batch_issuer" > "${job_results[$job_idx]}"
                 } >"${job_logs[$job_idx]}" 2>&1
             ) &
             active_pids+=("$!")
@@ -885,8 +896,9 @@ if [[ -n "$hosts_file" ]]; then
             batch_rc=
             batch_overall=
             batch_reason=
-            IFS=$'\t' read -r batch_rc batch_overall batch_reason < "${job_results[$job_idx]}"
-            record_batch_result "${job_hosts[$job_idx]}" "${job_ports[$job_idx]}" "${batch_rc:-3}" "$batch_overall" "$batch_reason"
+            batch_issuer=
+            IFS=$'\t' read -r batch_rc batch_overall batch_reason batch_issuer < "${job_results[$job_idx]}"
+            record_batch_result "${job_hosts[$job_idx]}" "${job_ports[$job_idx]}" "${batch_rc:-3}" "$batch_overall" "$batch_reason" "$batch_issuer"
         done
     fi
 
