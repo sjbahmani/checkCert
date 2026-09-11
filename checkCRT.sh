@@ -9,7 +9,7 @@
 
 set -u -o pipefail
 
-VERSION=1.9.0
+VERSION=1.9.1
 verify_peer=1
 ca_file=
 ca_path=
@@ -623,8 +623,21 @@ check_host() {
 
     issuer_cn=
     if [[ -n "$issuer_cert" ]]; then
-        issuer_cn=$(openssl x509 -in "$issuer_cert" -noout -subject -nameopt multiline 2>/dev/null \
-            | awk -F'= *' '/commonName/{print $2; exit}')
+        local issuer_multiline issuer_cn_val issuer_o_val issuer_c_val
+        local -a issuer_parts=()
+        issuer_multiline=$(openssl x509 -in "$issuer_cert" -noout -subject -nameopt multiline 2>/dev/null)
+        issuer_cn_val=$(awk -F'= *' '/commonName/{print $2; exit}' <<<"$issuer_multiline")
+        issuer_o_val=$(awk -F'= *' '/organizationName/{print $2; exit}' <<<"$issuer_multiline")
+        issuer_c_val=$(awk -F'= *' '/countryName/{print $2; exit}' <<<"$issuer_multiline")
+        # Escape embedded commas so a comma inside e.g. an organization name
+        # can't be mistaken for the CN=/O=/C= field separator.
+        issuer_cn_val=${issuer_cn_val//,/\\,}
+        issuer_o_val=${issuer_o_val//,/\\,}
+        issuer_c_val=${issuer_c_val//,/\\,}
+        [[ -n "$issuer_cn_val" ]] && issuer_parts+=("CN=$issuer_cn_val")
+        [[ -n "$issuer_o_val" ]] && issuer_parts+=("O=$issuer_o_val")
+        [[ -n "$issuer_c_val" ]] && issuer_parts+=("C=$issuer_c_val")
+        issuer_cn=$(IFS=,; echo "${issuer_parts[*]:-}")
     fi
     batch_issuer=$issuer_cn
 

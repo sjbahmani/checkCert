@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.9.1
+
+- The issuing CA shown in `ISSUER`, `BATCH SUMMARY`, and the JSON `issuer` field now includes organization and country, not just the common name — e.g. `CN=WE2,O=Google Trust Services,C=US` instead of just `WE2`. A comma embedded in a field value (e.g. an organization name) is escaped as `\,` so it can't be mistaken for the CN=/O=/C= separator.
+
 ## 1.9.0
 
 - `CA TREE` now recognizes cross-signed root rollovers accurately: when a node's own stated issuer can't be verified but the local trust store independently trusts a different, self-signed certificate with the same subject name (e.g. Google's `GTS Root R1` cross-signed by the retired `GlobalSign Root CA`), the tree walks into that equivalent root instead of ending in `[NOT PROVIDED]`, and the node reads `TRUST: TRUSTED (VIA EQUIVALENT ROOT)` / `SIGNATURE: VALID (CROSS-SIGNED)` instead of a misleading `UNTRUSTED/INVALID` / `UNKNOWN`. The candidate must itself be genuinely self-signed and independently trusted — this recognizes a real alternate signature path, not a public-key-matching shortcut. The leaf's overall `TRUST` line is unaffected either way.
