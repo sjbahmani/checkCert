@@ -1,0 +1,33 @@
+# Sample --hosts-file for checkCRT.sh: a mix of Iranian banks/services and
+# one non-Iranian baseline (google.com) for comparison.
+#   ./checkCRT.sh --hosts-file examples/hosts-iran.txt
+#   ./checkCRT.sh --json --hosts-file examples/hosts-iran.txt   # NDJSON
+#
+# bankmellat.ir uses Iran's national PKI root, which is not in the standard
+# OpenSSL/browser trust store, so it will report UNTRUSTED/INVALID here
+# unless you also pass:
+#   --ca-file examples/iran-root-ca.pem
+# Edit or trim this list for your own monitoring needs.
+
+# Banking
+bankmellat.ir
+bmi.ir
+sb24.ir
+
+# Marketplace / ride-hailing / e-commerce
+divar.ir
+tapsi.ir
+snapp.ir
+digikala.com
+
+# Telecom
+irancell.ir
+mci.ir
+
+# Media / news
+aparat.com
+varzesh3.com
+irna.ir
+
+# Baseline (non-Iranian, for comparison)
+google.com
