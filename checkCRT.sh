@@ -9,7 +9,7 @@
 
 set -u -o pipefail
 
-VERSION=1.7.0
+VERSION=1.8.0
 verify_peer=1
 ca_file=
 ca_path=
@@ -392,7 +392,7 @@ check_host() {
 
     local host_workdir connection_host is_ip sni_args connect_target starttls_args
     local -a warnings=()
-    local leaf stapled_ocsp
+    local leaf stapled_ocsp leaf_eku retry_workdir retry_eku status_retry_used=0
     local negotiated_protocol negotiated_cipher
     local leaf_text sig_alg pubkey_algo pubkey_bits key_usage_text
     local certificate_expired expiry_warning expiry_days_left end_date end_epoch
@@ -448,17 +448,6 @@ check_host() {
         return 3
     fi
 
-    stapled_ocsp='NOT STAPLED'
-    if grep -q 'OCSP response: no response sent' "$host_workdir/s_client.txt"; then
-        :
-    elif grep -qi 'Cert Status: *good' "$host_workdir/s_client.txt"; then
-        stapled_ocsp='PRESENT/GOOD (UNVERIFIED)'
-    elif grep -qi 'Cert Status: *revoked' "$host_workdir/s_client.txt"; then
-        stapled_ocsp='PRESENT/REVOKED (UNVERIFIED)'
-    elif grep -q 'OCSP response:' "$host_workdir/s_client.txt"; then
-        stapled_ocsp='PRESENT/UNKNOWN (UNVERIFIED)'
-    fi
-
     leaf="$host_workdir/cert-1.pem"
     if [[ ! -s "$leaf" ]]; then
         echo "Error: the server did not present a certificate." >&2
@@ -469,6 +458,55 @@ check_host() {
         echo "Error: the server returned an unreadable certificate." >&2
         emit_error_json "$domain" "$port" "the server returned an unreadable certificate"
         return 3
+    fi
+
+    # Some servers/load balancers misroute connections that request OCSP
+    # stapling (the -status flag above) to an unrelated backend -- e.g. an
+    # OCSP responder answering with its own signing certificate instead of
+    # the real TLS server certificate. That cert has no serverAuth EKU and
+    # cannot possibly match the hostname, so retry once without requesting
+    # stapling before treating the result as a genuine trust failure.
+    leaf_eku=$(openssl x509 -in "$leaf" -noout -ext extendedKeyUsage 2>/dev/null)
+    if [[ -n "$leaf_eku" ]] && ! grep -q 'TLS Web Server Authentication' <<<"$leaf_eku"; then
+        echo "Certificate has an unexpected purpose (no TLS Web Server Authentication); retrying without requesting OCSP stapling ..."
+        retry_workdir=$(mktemp -d "$host_workdir/retry.XXXXXX")
+        if timeout "$connect_timeout" openssl s_client -connect "$connect_target" "${sni_args[@]}" \
+                "${starttls_args[@]}" -showcerts </dev/null >"$retry_workdir/s_client.txt" 2>/dev/null \
+            && awk -v output_dir="$retry_workdir" '
+                    /-----BEGIN CERTIFICATE-----/ { number++; file=output_dir "/cert-" number ".pem"; writing=1 }
+                    writing { print > file }
+                    /-----END CERTIFICATE-----/ { close(file); writing=0 }
+                ' "$retry_workdir/s_client.txt" \
+            && [[ -s "$retry_workdir/cert-1.pem" ]] \
+            && openssl x509 -in "$retry_workdir/cert-1.pem" -noout >/dev/null 2>&1
+        then
+            retry_eku=$(openssl x509 -in "$retry_workdir/cert-1.pem" -noout -ext extendedKeyUsage 2>/dev/null)
+            if [[ -z "$retry_eku" ]] || grep -q 'TLS Web Server Authentication' <<<"$retry_eku"; then
+                echo "Retry without OCSP stapling returned a certificate with the expected purpose; using it instead."
+                add_warning "initial connection (requesting OCSP stapling) received a certificate with the wrong purpose (no TLS Web Server Authentication, likely an OCSP responder or unrelated backend); retried without OCSP stapling and used that result instead. Stapled OCSP could not be captured for this host."
+                status_retry_used=1
+                rm -f "$host_workdir"/cert-*.pem
+                cp "$retry_workdir"/cert-*.pem "$host_workdir"/
+                cp "$retry_workdir/s_client.txt" "$host_workdir/s_client.txt"
+            else
+                echo "Retry without OCSP stapling still returned an unexpected certificate purpose; keeping the original result." >&2
+            fi
+        else
+            echo "Retry without OCSP stapling failed to connect; keeping the original result." >&2
+        fi
+    fi
+
+    stapled_ocsp='NOT STAPLED'
+    if (( status_retry_used == 0 )); then
+        if grep -q 'OCSP response: no response sent' "$host_workdir/s_client.txt"; then
+            :
+        elif grep -qi 'Cert Status: *good' "$host_workdir/s_client.txt"; then
+            stapled_ocsp='PRESENT/GOOD (UNVERIFIED)'
+        elif grep -qi 'Cert Status: *revoked' "$host_workdir/s_client.txt"; then
+            stapled_ocsp='PRESENT/REVOKED (UNVERIFIED)'
+        elif grep -q 'OCSP response:' "$host_workdir/s_client.txt"; then
+            stapled_ocsp='PRESENT/UNKNOWN (UNVERIFIED)'
+        fi
     fi
 
     echo

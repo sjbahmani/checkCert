@@ -15,6 +15,7 @@ GOOD_PORT=8991
 REVOKED_PORT=8992
 LEAF3_PORT=8993
 AIA_PORT=8994
+OCSP_PURPOSE_PORT=8995
 
 export HTTPPORT
 PKI_DIR=$(bash "$script_dir/setup_pki.sh")
@@ -48,9 +49,11 @@ start_server "$REVOKED_PORT" "$PKI_DIR/certs/leaf-revoked.pem" "$PKI_DIR/chain-g
 start_server "$LEAF3_PORT" "$PKI_DIR/certs/leaf3.pem" "$PKI_DIR/chain3.pem"
 # leaf-good served ALONE (no chain) to force AIA-based issuer recovery
 start_server "$AIA_PORT" "$PKI_DIR/certs/leaf-good.pem"
+# leaf-ocsp-purpose: wrong EKU (no serverAuth), exercises the -status retry
+start_server "$OCSP_PURPOSE_PORT" "$PKI_DIR/certs/leaf-ocsp-purpose.pem" "$PKI_DIR/chain-good.pem"
 
 sleep 1
-for p in "$HTTPPORT" "$GOOD_PORT" "$REVOKED_PORT" "$LEAF3_PORT" "$AIA_PORT"; do
+for p in "$HTTPPORT" "$GOOD_PORT" "$REVOKED_PORT" "$LEAF3_PORT" "$AIA_PORT" "$OCSP_PURPOSE_PORT"; do
     timeout 3 bash -c "echo > /dev/tcp/127.0.0.1/$p" 2>/dev/null || {
         echo "FAIL: server on port $p did not come up" >&2
         exit 1
@@ -94,6 +97,21 @@ fi
 
 check_exit "leaf-good served alone (no chain): AIA-recovered issuer -> VALID" 0 \
     "$check" --ca-file "$PKI_DIR/certs/root.pem" 127.0.0.1 "$AIA_PORT"
+
+# leaf-ocsp-purpose always presents the same (wrong-purpose) cert regardless
+# of -status, so the retry fires, detects it's still wrong, and correctly
+# falls back to reporting an untrusted/invalid-purpose result (exit 5) —
+# this exercises the retry code path without requiring a server that
+# actually changes certs based on OCSP-stapling requests, as msn.com's does.
+check_exit "leaf-ocsp-purpose: wrong EKU triggers retry, still wrong -> exit 5" 5 \
+    "$check" --ca-file "$PKI_DIR/certs/root.pem" 127.0.0.1 "$OCSP_PURPOSE_PORT"
+if grep -q "unexpected purpose" /tmp/functest.out && grep -q "still returned an unexpected certificate purpose" /tmp/functest.err; then
+    echo "PASS: OCSP-stapling retry fallback triggered and handled correctly"
+    pass=$((pass + 1))
+else
+    echo "FAIL: OCSP-stapling retry fallback did not trigger as expected"
+    fail=$((fail + 1))
+fi
 
 # --hosts-file batch mode: one good, one revoked -> overall exit 1
 cat > "$PKI_DIR/hosts.txt" <<EOF

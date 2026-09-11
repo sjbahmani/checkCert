@@ -147,6 +147,20 @@ is marked `UNVERIFIED` because OpenSSL's `s_client` text output does not expose
 the raw staple for independent signature verification. The direct OCSP query
 remains the verified revocation result.
 
+The script always requests OCSP stapling (the TLS `status_request` extension)
+so it can report `STAPLED OCSP`. A few servers/load balancers misroute
+connections that request it to an unrelated backend — e.g. an internal OCSP
+responder answering with its own signing certificate instead of the real
+site certificate (observed on `msn.com` from some network paths). When the
+received leaf has an `extendedKeyUsage` that excludes TLS Web Server
+Authentication, the script automatically retries once without requesting
+stapling; if that retry comes back with a normal server certificate, it's
+used for the rest of the check, `STAPLED OCSP` is skipped for that host (it
+wasn't requested on the retry), and an `ADVISORY WARNINGS` entry records
+that this happened. If the retry is still the wrong purpose, the original
+result stands — this is not a fallback to "assume valid," just a way to
+avoid a false `UNTRUSTED/INVALID` caused purely by asking for stapling.
+
 Every intermediate CA in the resolvable chain (leaf → ... → root) is checked
 against its *own* CRL/OCSP too, not just the leaf: a revoked intermediate
 invalidates everything it issued even when the leaf's own certificate looks

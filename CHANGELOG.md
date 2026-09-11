@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.8.0
+
+- Added an automatic retry for a rare but real failure mode: some servers/load balancers misroute connections that request OCSP stapling to an unrelated backend (e.g. an OCSP responder answering with its own signing certificate, observed on `msn.com`). When the received certificate's `extendedKeyUsage` excludes TLS Web Server Authentication, checkCRT.sh now retries once without requesting OCSP stapling and uses that result if it looks like a normal server certificate, noting the fallback in `ADVISORY WARNINGS` (and skipping `STAPLED OCSP` for that host, since it wasn't requested on the retry). If the retry is still wrong, the original result stands.
+- Added a functional test (local PKI leaf with OCSP-signing-only EKU) covering the retry trigger and its "still wrong" fallback path.
+
 ## 1.7.0
 
 - `CA TREE` can now resolve and verify roots that the server didn't present but that are already in the system's default trust store (checked once per run, plus `SSL_CERT_FILE`/`--ca-file`), instead of always showing them as `[NOT PROVIDED]`/`SIGNATURE: UNKNOWN` even when `TRUST` was already correctly `TRUSTED` via that same store.

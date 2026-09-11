@@ -82,6 +82,21 @@ for name in leaf-good leaf-revoked; do
         -days 825 -sha256 -extfile leaf_ext.cnf -out "certs/${name}.pem" >/dev/null 2>&1
 done
 
+# --- Leaf with the "wrong purpose" (OCSP-signing only, no serverAuth) used to
+# exercise the OCSP-stapling-misroute retry fallback in checkCRT.sh ---
+cat > leaf_ocsp_purpose_ext.cnf <<EOF
+basicConstraints=critical,CA:false
+keyUsage=critical,digitalSignature
+extendedKeyUsage=OCSPSigning
+subjectAltName=IP:127.0.0.1
+authorityKeyIdentifier=keyid:always
+subjectKeyIdentifier=hash
+EOF
+openssl genrsa -out private/leaf-ocsp-purpose.key 2048 >/dev/null 2>&1
+openssl req -new -key private/leaf-ocsp-purpose.key -subj "/CN=leaf-ocsp-purpose.test" -out leaf-ocsp-purpose.csr >/dev/null 2>&1
+openssl x509 -req -in leaf-ocsp-purpose.csr -CA certs/intermediate.pem -CAkey private/intermediate.key -CAcreateserial \
+    -days 825 -sha256 -extfile leaf_ocsp_purpose_ext.cnf -out certs/leaf-ocsp-purpose.pem >/dev/null 2>&1
+
 # --- Leaf signed by 'intermediate2' (itself fine; issuer will be revoked) ---
 cat > leaf3_ext.cnf <<EOF
 basicConstraints=critical,CA:false
