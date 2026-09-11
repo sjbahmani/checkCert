@@ -103,6 +103,34 @@ EOF
 check_exit "batch mode: mixed good+revoked hosts -> exit 1" 1 \
     "$check" --ca-file "$PKI_DIR/certs/root.pem" --hosts-file "$PKI_DIR/hosts.txt"
 
+# --parallel N: same aggregate result whether sequential (1) or concurrent (3),
+# with a repeated host list so real parallelism actually kicks in.
+cat > "$PKI_DIR/hosts-repeated.txt" <<EOF
+127.0.0.1 $GOOD_PORT
+127.0.0.1 $REVOKED_PORT
+127.0.0.1 $GOOD_PORT
+127.0.0.1 $REVOKED_PORT
+EOF
+check_exit "--parallel 3: repeated good+revoked hosts -> exit 1" 1 \
+    "$check" --ca-file "$PKI_DIR/certs/root.pem" --parallel 3 --hosts-file "$PKI_DIR/hosts-repeated.txt"
+if grep -q "VALID (2)" /tmp/functest.out && grep -q "REVOKED (2)" /tmp/functest.out; then
+    echo "PASS: --parallel 3 grouped summary counts are correct"
+    pass=$((pass + 1))
+else
+    echo "FAIL: --parallel 3 grouped summary counts are wrong"
+    fail=$((fail + 1))
+fi
+
+check_exit "--parallel 1 (sequential): same hosts -> exit 1" 1 \
+    "$check" --ca-file "$PKI_DIR/certs/root.pem" --parallel 1 --hosts-file "$PKI_DIR/hosts-repeated.txt"
+if grep -q "VALID (2)" /tmp/functest.out && grep -q "REVOKED (2)" /tmp/functest.out; then
+    echo "PASS: --parallel 1 grouped summary counts are correct"
+    pass=$((pass + 1))
+else
+    echo "FAIL: --parallel 1 grouped summary counts are wrong"
+    fail=$((fail + 1))
+fi
+
 echo
 echo "Functional tests: $pass passed, $fail failed."
 (( fail == 0 ))

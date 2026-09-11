@@ -9,7 +9,7 @@
 
 set -u -o pipefail
 
-VERSION=1.4.0
+VERSION=1.5.0
 verify_peer=1
 ca_file=
 ca_path=
@@ -25,6 +25,7 @@ expiry_warn_days=30
 check_caa=1
 fail_on_expiry_warning=0
 hosts_file=
+batch_parallel=6
 positionals=()
 
 usage() {
@@ -58,6 +59,13 @@ Options:
                       single positional host/port. Blank lines and lines
                       starting with # are ignored. Other options (CA trust,
                       STARTTLS, timeouts, ...) apply to every host checked.
+  --parallel N        With --hosts-file, check up to N hosts concurrently
+                      (default: 6). N=1 checks sequentially and streams
+                      each host's output as it runs; N>1 buffers each
+                      host's output and prints it in input-file order once
+                      that host's check completes, so results still appear
+                      grouped and readable even though hosts finish out of
+                      order. Requires Bash 4.3+ (uses "wait -n").
   -h, --help          Show this help.
   --version           Show the version.
 EOF
@@ -71,7 +79,7 @@ while (( $# > 0 )); do
         --json) output_format=json ;;
         --no-caa) check_caa=0 ;;
         --fail-on-expiry-warning) fail_on_expiry_warning=1 ;;
-        --connect-timeout|--request-timeout|--max-ocsp-age|--clock-skew|--proxy|--no-proxy|--ca-path|--starttls|--expiry-warn-days|--hosts-file)
+        --connect-timeout|--request-timeout|--max-ocsp-age|--clock-skew|--proxy|--no-proxy|--ca-path|--starttls|--expiry-warn-days|--hosts-file|--parallel)
             option_name=$1
             shift
             [[ $# -gt 0 ]] || { echo "Error: $option_name requires a value." >&2; exit 1; }
@@ -86,6 +94,7 @@ while (( $# > 0 )); do
                 --starttls) starttls_proto=$1 ;;
                 --expiry-warn-days) expiry_warn_days=$1 ;;
                 --hosts-file) hosts_file=$1 ;;
+                --parallel) batch_parallel=$1 ;;
             esac
             ;;
         --ca-file)
@@ -104,6 +113,7 @@ while (( $# > 0 )); do
         --starttls=*) starttls_proto=${1#--starttls=} ;;
         --expiry-warn-days=*) expiry_warn_days=${1#--expiry-warn-days=} ;;
         --hosts-file=*) hosts_file=${1#--hosts-file=} ;;
+        --parallel=*) batch_parallel=${1#--parallel=} ;;
         --) shift; positionals+=("$@"); break ;;
         -*) echo "Error: unknown option: $1" >&2; usage; exit 1 ;;
         *) positionals+=("$1") ;;
@@ -141,6 +151,10 @@ for setting in connect_timeout request_timeout max_ocsp_age clock_skew; do
 done
 if ! [[ "$expiry_warn_days" =~ ^[0-9]+$ ]]; then
     echo "Error: expiry_warn_days must be a non-negative number of days." >&2
+    exit 1
+fi
+if ! [[ "$batch_parallel" =~ ^[0-9]+$ ]] || (( batch_parallel < 1 )); then
+    echo "Error: --parallel must be a positive integer." >&2
     exit 1
 fi
 for command in openssl awk sed grep mktemp timeout tr sort date; do
@@ -795,29 +809,87 @@ check_host() {
 }
 
 if [[ -n "$hosts_file" ]]; then
+    declare -a job_hosts=() job_ports=()
+    while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
+        read -r parsed_host parsed_port _ <<<"$raw_line"
+        [[ -z "$parsed_host" || "$parsed_host" == \#* ]] && continue
+        job_hosts+=("$parsed_host")
+        job_ports+=("${parsed_port:-443}")
+    done < "$hosts_file"
+
+    batch_total=${#job_hosts[@]}
     batch_worst=0
-    batch_total=0
     declare -A batch_group_lines=()
     declare -a batch_group_order=()
-    while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
-        read -r batch_host batch_port _ <<<"$raw_line"
-        [[ -z "$batch_host" || "$batch_host" == \#* ]] && continue
-        batch_port=${batch_port:-443}
-        echo
-        echo "############################################################"
-        echo "### ${batch_host}:${batch_port}"
-        echo "############################################################"
-        batch_overall=
-        batch_reason=
-        check_host "$batch_host" "$batch_port"
-        batch_rc=$?
-        batch_total=$((batch_total + 1))
-        batch_overall=${batch_overall:-UNKNOWN}
-        batch_reason=${batch_reason:-"no reason recorded"}
-        [[ -n "${batch_group_lines[$batch_overall]+x}" ]] || batch_group_order+=("$batch_overall")
-        batch_group_lines["$batch_overall"]+="  ${batch_host}:${batch_port}: ${batch_reason}"$'\n'
-        (( batch_rc != 0 )) && batch_worst=1
-    done < "$hosts_file"
+
+    record_batch_result() {
+        local h=$1 p=$2 rc=$3 overall=${4:-UNKNOWN} reason=${5:-"no reason recorded"}
+        [[ -n "${batch_group_lines[$overall]+x}" ]] || batch_group_order+=("$overall")
+        batch_group_lines["$overall"]+="  ${h}:${p}: ${reason}"$'\n'
+        (( rc != 0 )) && batch_worst=1
+    }
+
+    if (( batch_parallel <= 1 )); then
+        for job_idx in "${!job_hosts[@]}"; do
+            batch_host=${job_hosts[$job_idx]}
+            batch_port=${job_ports[$job_idx]}
+            echo
+            echo "############################################################"
+            echo "### ${batch_host}:${batch_port}"
+            echo "############################################################"
+            batch_overall=
+            batch_reason=
+            check_host "$batch_host" "$batch_port"
+            batch_rc=$?
+            record_batch_result "$batch_host" "$batch_port" "$batch_rc" "$batch_overall" "$batch_reason"
+        done
+    else
+        declare -a job_logs=() job_results=() active_pids=() active_idx=()
+        for job_idx in "${!job_hosts[@]}"; do
+            batch_host=${job_hosts[$job_idx]}
+            batch_port=${job_ports[$job_idx]}
+            job_logs[job_idx]=$(mktemp "$workdir/batch-log.XXXXXX")
+            job_results[job_idx]=$(mktemp "$workdir/batch-res.XXXXXX")
+            (
+                {
+                    echo
+                    echo "############################################################"
+                    echo "### ${batch_host}:${batch_port}"
+                    echo "############################################################"
+                    batch_overall=
+                    batch_reason=
+                    check_host "$batch_host" "$batch_port"
+                    batch_rc=$?
+                    printf '%s\t%s\t%s\n' "$batch_rc" "$batch_overall" "$batch_reason" > "${job_results[$job_idx]}"
+                } >"${job_logs[$job_idx]}" 2>&1
+            ) &
+            active_pids+=("$!")
+            active_idx+=("$job_idx")
+            if (( ${#active_pids[@]} >= batch_parallel )); then
+                wait -n
+                new_pids=() new_idx=()
+                for i in "${!active_pids[@]}"; do
+                    if kill -0 "${active_pids[$i]}" 2>/dev/null; then
+                        new_pids+=("${active_pids[$i]}")
+                        new_idx+=("${active_idx[$i]}")
+                    fi
+                done
+                active_pids=("${new_pids[@]}")
+                active_idx=("${new_idx[@]}")
+            fi
+        done
+        wait
+
+        for job_idx in "${!job_hosts[@]}"; do
+            cat "${job_logs[$job_idx]}"
+            batch_rc=
+            batch_overall=
+            batch_reason=
+            IFS=$'\t' read -r batch_rc batch_overall batch_reason < "${job_results[$job_idx]}"
+            record_batch_result "${job_hosts[$job_idx]}" "${job_ports[$job_idx]}" "${batch_rc:-3}" "$batch_overall" "$batch_reason"
+        done
+    fi
+
     if [[ "$output_format" != json ]]; then
         # Problems first, then healthy results; anything unforeseen falls
         # back to the order categories were first seen.

@@ -6,7 +6,8 @@ distribution points and OCSP.
 
 ## Requirements
 
-Linux or another environment with Bash 4+, OpenSSL, `curl` or `wget`, GNU
+Linux or another environment with Bash 4.3+ (needed for `wait -n`, used by
+`--hosts-file`'s default parallel mode), OpenSSL, `curl` or `wget`, GNU
 `timeout`, `date`, `awk`, `sed`, `grep`, `sort`, `tr`, and `mktemp`. LDAP CRL
 and AIA issuer URLs are detected and skipped with a clear message, since they
 cannot be fetched by `curl`/`wget` in this script. `dig`, `host`, or
@@ -71,13 +72,33 @@ mail.example.com 587
 ```
 
 Every other option (`--ca-file`, `--starttls`, timeouts, `--expiry-warn-days`,
-...) applies to every host in the file — there is no per-host override. Each
-host's full report prints in turn, followed by a `BATCH SUMMARY` line per
-host; in `--json` mode each host instead writes one JSON object, so standard
-output becomes newline-delimited JSON (NDJSON), not a single array. The
-process exit code is `0` only if every host exited `0`; otherwise it's `1` —
-inspect each host's own `exit_code`/`OVERALL` for detail rather than relying
-on the aggregate.
+...) applies to every host in the file — there is no per-host override. In
+`--json` mode each host writes one JSON object, so standard output becomes
+newline-delimited JSON (NDJSON), not a single array. The process exit code is
+`0` only if every host exited `0`; otherwise it's `1` — inspect each host's
+own `exit_code`/`OVERALL` for detail rather than relying on the aggregate.
+
+Hosts are checked `--parallel N` at a time (default `6`; requires Bash 4.3+).
+With `N=1`, hosts run strictly in order and each one's output streams as it
+runs. With `N>1`, each host's output is buffered and printed once that host
+finishes, but always in the file's original order — so results stay
+readable and easy to scan even though hosts may finish out of order (NDJSON
+lines in `--json` mode, however, are written in *completion* order, not
+input order, since they stream live as each host finishes). After the
+per-host reports, `BATCH SUMMARY` groups every host by outcome — problems
+first (`REVOKED`, `EXPIRED`, `UNTRUSTED/INVALID`, `ERROR`, `UNKNOWN`), then
+`VALID` — each with a plain-language reason instead of a bare exit code:
+
+```text
+BATCH SUMMARY (4 host(s) checked)
+
+REVOKED (1)
+  bmi.ir:443: leaf certificate is revoked
+
+VALID (3)
+  example.com:443: trusted, not revoked, not expiring soon
+  ...
+```
 
 ## STARTTLS
 

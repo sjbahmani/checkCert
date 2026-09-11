@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.5.0
+
+- `--hosts-file` now checks hosts concurrently by default: new `--parallel N` (default 6, requires Bash 4.3+); `--parallel 1` restores strictly sequential, streaming-as-it-runs behavior. Per-host output stays in input-file order regardless; NDJSON lines in `--json` mode are written in completion order.
+- `BATCH SUMMARY` now groups hosts by outcome (problems first: REVOKED, EXPIRED, UNTRUSTED/INVALID, ERROR, UNKNOWN, then VALID) with a full plain-language reason per host, instead of a flat list of bare exit codes.
+- Fixed: a host that failed before completing a check (connection failure, no certificate presented, etc.) previously vanished from `--json`/`--hosts-file` output entirely; it now emits a minimal JSON record (`overall: ERROR`, `exit_code: 3`, an `error` message).
+
 ## 1.4.0
 
 - Added `--hosts-file FILE` batch mode to check a list of hosts in one run (NDJSON in `--json` mode); process exit is 0 only if every host exited 0, otherwise 1.
