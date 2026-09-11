@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.4.0
+
+- Added `--hosts-file FILE` batch mode to check a list of hosts in one run (NDJSON in `--json` mode); process exit is 0 only if every host exited 0, otherwise 1.
+- Revocation checking now also covers every intermediate CA in the resolvable chain, not just the leaf; a revoked intermediate is flagged `[REVOKED]` in the CA TREE, warned about, and escalates `REVOCATION`/`OVERALL` to REVOKED.
+- Added `--fail-on-expiry-warning` to opt into a dedicated exit code 6 for an otherwise-valid certificate that is only expiring soon (default behavior, exit 0, is unchanged).
+- Fixed: chain trust verification now includes the issuer certificate recovered via AIA, so servers that omit their intermediate are no longer incorrectly reported UNTRUSTED/INVALID.
+- Added `tests/functional/` — a local, disposable PKI + `openssl s_server`/`http.server` harness that exercises the full pipeline end-to-end (valid, revoked leaf, revoked intermediate, AIA chain recovery, batch mode) without depending on real Internet hosts; wired into CI.
+
 ## 1.3.0
 
 - Added `--starttls PROTO` for SMTP/IMAP/POP3/FTP/LDAP/XMPP/etc. services that upgrade to TLS.

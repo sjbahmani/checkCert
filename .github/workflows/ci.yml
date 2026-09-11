@@ -17,3 +17,5 @@ jobs:
           scandir: .
       - name: Run CLI regression tests
         run: ./tests/test_cli.sh
+      - name: Run functional tests (local PKI, no network required)
+        run: ./tests/functional/run.sh

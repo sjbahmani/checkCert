@@ -25,6 +25,7 @@ lookup is skipped, not fatal, when none are installed.
 ./checkCRT.sh --starttls smtp mail.example.com 587
 ./checkCRT.sh --expiry-warn-days 14 example.com
 ./checkCRT.sh --no-caa internal.example
+./checkCRT.sh --hosts-file hosts.txt
 ```
 
 The script always validates the chain and the supplied hostname (or IP address)
@@ -45,8 +46,30 @@ Iran's national PKI:
 messages are written to standard error. This makes it suitable for monitoring:
 
 ```json
-{"host":"example.com","port":443,"trust":"TRUSTED","revocation":"NOT REVOKED","expiry":"NOT EXPIRED","expiry_days_left":46,"stapled_ocsp":"NOT STAPLED","overall":"VALID","exit_code":0,"warnings":[]}
+{"host":"example.com","port":443,"trust":"TRUSTED","revocation":"NOT REVOKED","expiry":"NOT EXPIRED","expiry_days_left":46,"intermediate_revoked":false,"stapled_ocsp":"NOT STAPLED","overall":"VALID","exit_code":0,"warnings":[]}
 ```
+
+## Batch mode
+
+`--hosts-file FILE` checks every host in `FILE` instead of a single
+positional host/port, one `host [port]` per line (port defaults to 443).
+Blank lines and lines starting with `#` are ignored:
+
+```text
+# production endpoints
+example.com
+internal.example 8443
+mail.example.com 587
+```
+
+Every other option (`--ca-file`, `--starttls`, timeouts, `--expiry-warn-days`,
+...) applies to every host in the file — there is no per-host override. Each
+host's full report prints in turn, followed by a `BATCH SUMMARY` line per
+host; in `--json` mode each host instead writes one JSON object, so standard
+output becomes newline-delimited JSON (NDJSON), not a single array. The
+process exit code is `0` only if every host exited `0`; otherwise it's `1` —
+inspect each host's own `exit_code`/`OVERALL` for detail rather than relying
+on the aggregate.
 
 ## STARTTLS
 
@@ -64,7 +87,9 @@ non-fatal `ADVISORY WARNINGS` list (and the JSON `warnings` array):
 
 - **Expiry warning** — `--expiry-warn-days N` (default 30; `0` disables it)
   flags certificates expiring soon. `EXPIRY` can now report `EXPIRING SOON` in
-  addition to `NOT EXPIRED`/`EXPIRED`; this does not change the exit code.
+  addition to `NOT EXPIRED`/`EXPIRED`. By default this does not change the
+  exit code; pass `--fail-on-expiry-warning` to exit `6` instead of `0` for
+  an otherwise-valid certificate that is only expiring soon.
 - **Weak cryptography** — deprecated TLS protocol versions/ciphers negotiated
   on the connection, MD5/SHA-1 certificate signatures, and undersized RSA/DSA
   (< 2048 bit) or EC (< 224 bit) public keys.
@@ -92,6 +117,15 @@ is marked `UNVERIFIED` because OpenSSL's `s_client` text output does not expose
 the raw staple for independent signature verification. The direct OCSP query
 remains the verified revocation result.
 
+Every intermediate CA in the resolvable chain (leaf → ... → root) is checked
+against its *own* CRL/OCSP too, not just the leaf: a revoked intermediate
+invalidates everything it issued even when the leaf's own certificate looks
+fine. A revoked intermediate is reported as `[REVOKED]` in the `CA TREE`, adds
+an `ADVISORY WARNINGS` entry naming it, sets JSON `intermediate_revoked: true`,
+and escalates `REVOCATION`/`OVERALL` to `REVOKED` (exit 2) exactly like a
+revoked leaf. The chain walk stops at the root (never revocation-checked
+against itself) or at the first unresolvable issuer.
+
 Use `--connect-timeout`, `--request-timeout`, `--max-ocsp-age`, and
 `--clock-skew` to tune monitoring behavior. `--proxy` and `--no-proxy` apply
 to CRL and OCSP HTTP requests; direct TLS certificate retrieval is not routed
@@ -102,10 +136,15 @@ through an HTTP proxy.
 | Code | Meaning |
 | --- | --- |
 | 0 | Trusted, identity-valid, not expired, and not revoked by at least one verified CRL or OCSP response. |
-| 2 | Revoked. |
+| 2 | Revoked (the leaf certificate or an intermediate CA in its chain). |
 | 3 | Unknown or operational/verification error. |
 | 4 | Expired. |
 | 5 | CA chain is untrusted, invalid, or does not match the supplied hostname/IP. |
+| 6 | Valid but expiring soon — only with `--fail-on-expiry-warning`; otherwise this case still exits `0` (see [Advisory checks](#advisory-checks)). |
+
+In `--hosts-file` mode the *process* exit code is `0` only if every host
+exited `0`, otherwise `1` (see [Batch mode](#batch-mode)); these per-host
+codes still apply to each host's own result within the run.
 
 Every completed check ends with this machine-readable, uppercase summary:
 
@@ -143,4 +182,16 @@ the local system store.
 ```bash
 bash -n checkCRT.sh
 shellcheck -s bash checkCRT.sh
+./tests/test_cli.sh          # CLI parsing/validation, no network
+./tests/functional/run.sh    # end-to-end against a local throwaway PKI
 ```
+
+`tests/functional/run.sh` builds a disposable root CA, two intermediates, and
+three leaves (see `tests/functional/setup_pki.sh`), serves them over local
+`openssl s_server`/`http.server` instances on 127.0.0.1, and asserts
+`checkCRT.sh`'s exit code and output for: a valid chain, a revoked leaf, a
+revoked intermediate (with an otherwise-fine leaf), a server that omits its
+intermediate (regression test for AIA-based chain recovery), and
+`--hosts-file` batch mode. It binds local TCP ports, so it needs permission
+to do so in restricted/sandboxed environments; it makes no real network
+requests.
