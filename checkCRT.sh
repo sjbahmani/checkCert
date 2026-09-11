@@ -334,7 +334,7 @@ check_host() {
     local negotiated_protocol negotiated_cipher
     local leaf_text sig_alg pubkey_algo pubkey_bits key_usage_text
     local certificate_expired expiry_warning expiry_days_left end_date end_epoch
-    local serial leaf_issuer issuer_cert
+    local leaf_issuer issuer_cert
     local -a issuer_urls=()
     local index issuer_download issuer_candidate
     local chain_bundle
@@ -346,7 +346,6 @@ check_host() {
     local ci cert subj iss verifier
     local checked=0 revoked=0 ocsp_good=0
     local rc_checked rc_revoked rc_ocsp_good
-    local ocsp_url
     local trust_status expiry_status revocation_status overall_status exit_code
     local caa_records
 
@@ -477,7 +476,6 @@ check_host() {
         echo "Certificate validity: EXPIRED (or expires at the current time)" >&2
     fi
 
-    serial=$(openssl x509 -in "$leaf" -noout -serial | sed 's/^serial=//' | tr -d ':' | tr '[:lower:]' '[:upper:]')
     leaf_issuer=$(openssl x509 -in "$leaf" -noout -issuer -nameopt RFC2253 | sed 's/^issuer=//')
     issuer_cert=
     is_issuer_of_leaf() {
@@ -760,7 +758,6 @@ if [[ -n "$hosts_file" ]]; then
     batch_worst=0
     batch_results=()
     while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
-        batch_host= batch_port=
         read -r batch_host batch_port _ <<<"$raw_line"
         [[ -z "$batch_host" || "$batch_host" == \#* ]] && continue
         batch_port=${batch_port:-443}

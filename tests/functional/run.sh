@@ -37,7 +37,8 @@ start_server() {
 }
 
 (cd "$PKI_DIR/www" && python3 -m http.server "$HTTPPORT" >"$PKI_DIR/httpd.log" 2>&1 &)
-pids+=($(pgrep -f "http.server $HTTPPORT" | tail -1))
+httpd_pid=$(pgrep -f "http.server $HTTPPORT" | tail -1)
+pids+=("$httpd_pid")
 
 # leaf-good served with its full chain (intermediate)
 start_server "$GOOD_PORT" "$PKI_DIR/certs/leaf-good.pem" "$PKI_DIR/chain-good.pem"
@@ -83,13 +84,13 @@ check_exit "leaf-revoked: full chain presented -> REVOKED" 2 \
 
 check_exit "leaf3: fine itself, but issuing intermediate2 is revoked -> REVOKED" 2 \
     "$check" --ca-file "$PKI_DIR/certs/root.pem" 127.0.0.1 "$LEAF3_PORT"
-grep -q "intermediate CA .* is REVOKED" /tmp/functest.err && {
+if grep -q "intermediate CA .* is REVOKED" /tmp/functest.err; then
     echo "PASS: intermediate-revocation warning present"
     pass=$((pass + 1))
-} || {
+else
     echo "FAIL: intermediate-revocation warning missing"
     fail=$((fail + 1))
-}
+fi
 
 check_exit "leaf-good served alone (no chain): AIA-recovered issuer -> VALID" 0 \
     "$check" --ca-file "$PKI_DIR/certs/root.pem" 127.0.0.1 "$AIA_PORT"
