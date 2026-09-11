@@ -24,6 +24,22 @@ digikala.com
 irancell.ir
 mci.ir
 
+# Crypto exchanges
+bitpin.ir
+wallex.ir
+nobitex.ir
+
+# Cloud providers
+arvancloud.ir
+sotoon.ir
+
+# Government
+dolat.ir
+president.ir
+mfa.ir
+cbi.ir
+majlis.ir
+
 # Media / news
 aparat.com
 varzesh3.com

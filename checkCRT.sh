@@ -180,6 +180,16 @@ json_escape() {
     printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e ':a' -e 'N' -e '$!ba' -e 's/\n/\\n/g'
 }
 
+# Emits a JSON record for a host that failed before a full check could be
+# completed (e.g. connection failure), so --json/--hosts-file consumers see
+# one line per host attempted instead of that host silently disappearing.
+emit_error_json() {
+    local err_domain=$1 err_port=$2 message=$3
+    [[ "$output_format" == json ]] || return 0
+    printf '{"host":"%s","port":%s,"trust":null,"revocation":null,"expiry":null,"expiry_days_left":null,"intermediate_revoked":null,"stapled_ocsp":null,"overall":"ERROR","exit_code":3,"warnings":[],"error":"%s"}\n' \
+        "$(json_escape "$err_domain")" "$err_port" "$(json_escape "$message")" >&3
+}
+
 fetch() {
     local url=$1 destination=$2
     if command -v curl >/dev/null 2>&1; then
@@ -325,6 +335,7 @@ check_host() {
     local domain=$1 port=$2
     if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
         echo "Error: port must be between 1 and 65535 (got '$port' for host '$domain')." >&2
+        emit_error_json "$domain" "$port" "invalid port"
         return 3
     fi
 
@@ -372,14 +383,18 @@ check_host() {
     echo "Fetching TLS certificate from ${domain}:${port} ...${starttls_proto:+ (STARTTLS: $starttls_proto)}"
     if ! timeout "$connect_timeout" openssl s_client -connect "$connect_target" "${sni_args[@]}" \
         "${starttls_args[@]}" -showcerts -status </dev/null >"$host_workdir/s_client.txt" 2>/dev/null; then
-        echo "Error: unable to connect, negotiate STARTTLS, or retrieve the certificate chain." >&2; return 3
+        echo "Error: unable to connect, negotiate STARTTLS, or retrieve the certificate chain." >&2
+        emit_error_json "$domain" "$port" "unable to connect, negotiate STARTTLS, or retrieve the certificate chain"
+        return 3
     fi
     if ! awk -v output_dir="$host_workdir" '
             /-----BEGIN CERTIFICATE-----/ { number++; file=output_dir "/cert-" number ".pem"; writing=1 }
             writing { print > file }
             /-----END CERTIFICATE-----/ { close(file); writing=0 }
         ' "$host_workdir/s_client.txt"; then
-        echo "Error: unable to connect or retrieve the certificate chain." >&2; return 3
+        echo "Error: unable to connect or retrieve the certificate chain." >&2
+        emit_error_json "$domain" "$port" "unable to connect or retrieve the certificate chain"
+        return 3
     fi
 
     stapled_ocsp='NOT STAPLED'
@@ -394,9 +409,14 @@ check_host() {
     fi
 
     leaf="$host_workdir/cert-1.pem"
-    [[ -s "$leaf" ]] || { echo "Error: the server did not present a certificate." >&2; return 3; }
+    if [[ ! -s "$leaf" ]]; then
+        echo "Error: the server did not present a certificate." >&2
+        emit_error_json "$domain" "$port" "the server did not present a certificate"
+        return 3
+    fi
     if ! openssl x509 -in "$leaf" -noout >/dev/null 2>&1; then
         echo "Error: the server returned an unreadable certificate." >&2
+        emit_error_json "$domain" "$port" "the server returned an unreadable certificate"
         return 3
     fi
 
