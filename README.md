@@ -33,6 +33,14 @@ against OpenSSL's system trust store. Use `--ca-file` to add a private CA. The
 This is an OpenSSL/system-trust decision; browser trust stores may differ, so a
 result does not guarantee identical treatment by every browser.
 
+See [`examples/`](examples/) for sample private trust anchors to pass via
+`--ca-file`, such as `examples/iran-root-ca.pem` for checking sites under
+Iran's national PKI:
+
+```bash
+./checkCRT.sh --ca-file examples/iran-root-ca.pem bankmellat.ir
+```
+
 `--json` reserves standard output for one JSON object; progress and diagnostic
 messages are written to standard error. This makes it suitable for monitoring:
 
