@@ -131,7 +131,7 @@ cat > "$PKI_DIR/hosts-repeated.txt" <<EOF
 EOF
 check_exit "--parallel 3: repeated good+revoked hosts -> exit 1" 1 \
     "$check" --ca-file "$PKI_DIR/certs/root.pem" --parallel 3 --hosts-file "$PKI_DIR/hosts-repeated.txt"
-if grep -q "VALID (2)" /tmp/functest.out && grep -q "REVOKED (2)" /tmp/functest.out; then
+if [[ $(grep -c '^  VALID ' /tmp/functest.out) == 2 && $(grep -c '^  REVOKED ' /tmp/functest.out) == 2 ]]; then
     echo "PASS: --parallel 3 grouped summary counts are correct"
     pass=$((pass + 1))
 else
@@ -141,7 +141,7 @@ fi
 
 check_exit "--parallel 1 (sequential): same hosts -> exit 1" 1 \
     "$check" --ca-file "$PKI_DIR/certs/root.pem" --parallel 1 --hosts-file "$PKI_DIR/hosts-repeated.txt"
-if grep -q "VALID (2)" /tmp/functest.out && grep -q "REVOKED (2)" /tmp/functest.out; then
+if [[ $(grep -c '^  VALID ' /tmp/functest.out) == 2 && $(grep -c '^  REVOKED ' /tmp/functest.out) == 2 ]]; then
     echo "PASS: --parallel 1 grouped summary counts are correct"
     pass=$((pass + 1))
 else

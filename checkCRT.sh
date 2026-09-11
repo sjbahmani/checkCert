@@ -9,7 +9,7 @@
 
 set -u -o pipefail
 
-VERSION=1.9.1
+VERSION=1.10.0
 verify_peer=1
 ca_file=
 ca_path=
@@ -959,13 +959,14 @@ if [[ -n "$hosts_file" ]]; then
 
     batch_total=${#job_hosts[@]}
     batch_worst=0
-    declare -A batch_group_lines=()
-    declare -a batch_group_order=()
+    declare -a batch_row_host=() batch_row_overall=() batch_row_issuer=() batch_row_reason=()
 
     record_batch_result() {
         local h=$1 p=$2 rc=$3 overall=${4:-UNKNOWN} reason=${5:-"no reason recorded"} issuer=${6:-}
-        [[ -n "${batch_group_lines[$overall]+x}" ]] || batch_group_order+=("$overall")
-        batch_group_lines["$overall"]+="  ${h}:${p} [issuer: ${issuer:-unknown}]: ${reason}"$'\n'
+        batch_row_host+=("${h}:${p}")
+        batch_row_overall+=("$overall")
+        batch_row_issuer+=("${issuer:-unknown}")
+        batch_row_reason+=("$reason")
         (( rc != 0 )) && batch_worst=1
     }
 
@@ -1034,27 +1035,58 @@ if [[ -n "$hosts_file" ]]; then
     fi
 
     if [[ "$output_format" != json ]]; then
-        # Problems first, then healthy results; anything unforeseen falls
-        # back to the order categories were first seen.
+        # Problems first, then healthy results, each group in the order its
+        # hosts were checked; anything unforeseen falls back to first-seen.
         batch_priority=(REVOKED EXPIRED "UNTRUSTED/INVALID" ERROR UNKNOWN "VALID (EXPIRING SOON)" VALID)
-        batch_display_order=()
+        declare -a batch_order=()
         for batch_cat in "${batch_priority[@]}"; do
-            [[ -n "${batch_group_lines[$batch_cat]+x}" ]] && batch_display_order+=("$batch_cat")
-        done
-        for batch_cat in "${batch_group_order[@]}"; do
-            batch_seen=0
-            for batch_done in "${batch_display_order[@]}"; do
-                [[ "$batch_done" == "$batch_cat" ]] && { batch_seen=1; break; }
+            for batch_i in "${!batch_row_overall[@]}"; do
+                [[ "${batch_row_overall[$batch_i]}" == "$batch_cat" ]] && batch_order+=("$batch_i")
             done
-            (( batch_seen == 0 )) && batch_display_order+=("$batch_cat")
         done
+        for batch_i in "${!batch_row_overall[@]}"; do
+            batch_seen=0
+            for batch_j in "${batch_order[@]:-}"; do
+                [[ "$batch_j" == "$batch_i" ]] && { batch_seen=1; break; }
+            done
+            (( batch_seen == 0 )) && batch_order+=("$batch_i")
+        done
+
+        # Column widths: HOST/STATUS/ISSUER size to their widest value (ISSUER
+        # capped, longer values are shown truncated with an ellipsis); REASON
+        # is last and left unpadded so it isn't cut off.
+        batch_issuer_cap=42
+        declare -a batch_issuer_disp=()
+        batch_host_w=4
+        batch_status_w=6
+        batch_issuer_w=6
+        for batch_i in "${!batch_row_host[@]}"; do
+            (( ${#batch_row_host[$batch_i]} > batch_host_w )) && batch_host_w=${#batch_row_host[$batch_i]}
+            (( ${#batch_row_overall[$batch_i]} > batch_status_w )) && batch_status_w=${#batch_row_overall[$batch_i]}
+            batch_disp=${batch_row_issuer[$batch_i]}
+            if (( ${#batch_disp} > batch_issuer_cap )); then
+                batch_disp="${batch_disp:0:$((batch_issuer_cap - 1))}…"
+            fi
+            batch_issuer_disp[batch_i]=$batch_disp
+            (( ${#batch_disp} > batch_issuer_w )) && batch_issuer_w=${#batch_disp}
+        done
+
         echo
         echo "BATCH SUMMARY (${batch_total} host(s) checked)"
-        for batch_cat in "${batch_display_order[@]}"; do
-            batch_count=$(grep -c '.' <<<"${batch_group_lines[$batch_cat]}")
-            echo
-            echo "${batch_cat} (${batch_count})"
-            printf '%s' "${batch_group_lines[$batch_cat]}"
+        echo
+        printf '  %-*s  %-*s  %-*s  %s\n' \
+            "$batch_status_w" STATUS "$batch_host_w" HOST "$batch_issuer_w" ISSUER REASON
+        printf '  %s  %s  %s  %s\n' \
+            "$(printf '%*s' "$batch_status_w" '' | tr ' ' '-')" \
+            "$(printf '%*s' "$batch_host_w" '' | tr ' ' '-')" \
+            "$(printf '%*s' "$batch_issuer_w" '' | tr ' ' '-')" \
+            "$(printf '%*s' 6 '' | tr ' ' '-')"
+        for batch_i in "${batch_order[@]}"; do
+            printf '  %-*s  %-*s  %-*s  %s\n' \
+                "$batch_status_w" "${batch_row_overall[$batch_i]}" \
+                "$batch_host_w" "${batch_row_host[$batch_i]}" \
+                "$batch_issuer_w" "${batch_issuer_disp[$batch_i]}" \
+                "${batch_row_reason[$batch_i]}"
         done
     fi
     exit "$batch_worst"

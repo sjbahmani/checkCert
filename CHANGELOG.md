@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.10.0
+
+- `BATCH SUMMARY` is now rendered as an aligned table (STATUS, HOST, ISSUER, REASON columns) instead of per-category text blocks; rows are still ordered problems-first (REVOKED, EXPIRED, UNTRUSTED/INVALID, ERROR, UNKNOWN, then VALID). The ISSUER column truncates past 42 characters with `…`; REASON is never truncated.
+
 ## 1.9.1
 
 - The issuing CA shown in `ISSUER`, `BATCH SUMMARY`, and the JSON `issuer` field now includes organization and country, not just the common name — e.g. `CN=WE2,O=Google Trust Services,C=US` instead of just `WE2`. A comma embedded in a field value (e.g. an organization name) is escaped as `\,` so it can't be mistaken for the CN=/O=/C= separator.

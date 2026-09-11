@@ -85,21 +85,23 @@ finishes, but always in the file's original order — so results stay
 readable and easy to scan even though hosts may finish out of order (NDJSON
 lines in `--json` mode, however, are written in *completion* order, not
 input order, since they stream live as each host finishes). After the
-per-host reports, `BATCH SUMMARY` groups every host by outcome — problems
-first (`REVOKED`, `EXPIRED`, `UNTRUSTED/INVALID`, `ERROR`, `UNKNOWN`), then
-`VALID` — each line naming the immediate issuing CA before a plain-language
-reason instead of a bare exit code:
+per-host reports, `BATCH SUMMARY` lists every host as a table — rows ordered
+problems first (`REVOKED`, `EXPIRED`, `UNTRUSTED/INVALID`, `ERROR`,
+`UNKNOWN`), then `VALID` — with the immediate issuing CA and a
+plain-language reason instead of a bare exit code:
 
 ```text
 BATCH SUMMARY (4 host(s) checked)
 
-REVOKED (1)
-  bmi.ir:443 [issuer: CN=Certum OV TLS G2 R39 CA,O=Asseco Data Systems S.A.,C=PL]: leaf certificate is revoked
-
-VALID (3)
-  example.com:443 [issuer: CN=WE2,O=Google Trust Services,C=US]: trusted, not revoked, not expiring soon
+  STATUS   HOST            ISSUER                                      REASON
+  -------  --------------  ------------------------------------------  ------
+  REVOKED  bmi.ir:443      CN=Certum OV TLS G2 R39 CA,O=Asseco Data …  leaf certificate is revoked
+  VALID    example.com:443 CN=WE2,O=Google Trust Services,C=US         trusted, not revoked, not expiring soon
   ...
 ```
+
+The `ISSUER` column is truncated with `…` past 42 characters to keep the
+table readable; `REASON` is never truncated.
 
 ## STARTTLS
 
