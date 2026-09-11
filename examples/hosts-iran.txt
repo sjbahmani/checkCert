@@ -7,12 +7,20 @@
 # OpenSSL/browser trust store, so it will report UNTRUSTED/INVALID here
 # unless you also pass:
 #   --ca-file examples/iran-root-ca.pem
+# Some domestic sites respond slowly from outside their network; if you see
+# connection failures, retry with a longer --connect-timeout (e.g. 30).
 # Edit or trim this list for your own monitoring needs.
 
 # Banking
 bankmellat.ir
 bmi.ir
 sb24.ir
+banksepah.ir
+bsi.ir
+bank-maskan.ir
+tejaratbank.ir
+postbank.ir
+refah-bank.ir
 
 # Marketplace / ride-hailing / e-commerce
 divar.ir
