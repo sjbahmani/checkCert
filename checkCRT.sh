@@ -16,6 +16,8 @@ ca_path=
 output_format=text
 connect_timeout=20
 request_timeout=45
+connect_retries=2
+retry_delay=3
 max_ocsp_age=86400
 clock_skew=300
 proxy=
@@ -42,6 +44,9 @@ Options:
                       (one object per host, newline-delimited in batch mode).
   --connect-timeout N TLS connection timeout in seconds (default: 20).
   --request-timeout N CRL/OCSP request timeout in seconds (default: 45).
+  --connect-retries N Retry the initial TLS connection up to N extra times
+                      on failure (default: 2; 0 disables retrying).
+  --retry-delay N     Seconds to wait between connection retries (default: 3).
   --max-ocsp-age N    Maximum OCSP response age in seconds (default: 86400).
   --clock-skew N      Allowed clock skew for OCSP in seconds (default: 300).
   --proxy URL         HTTP(S) proxy for CRL/OCSP HTTP requests.
@@ -79,13 +84,15 @@ while (( $# > 0 )); do
         --json) output_format=json ;;
         --no-caa) check_caa=0 ;;
         --fail-on-expiry-warning) fail_on_expiry_warning=1 ;;
-        --connect-timeout|--request-timeout|--max-ocsp-age|--clock-skew|--proxy|--no-proxy|--ca-path|--starttls|--expiry-warn-days|--hosts-file|--parallel)
+        --connect-timeout|--request-timeout|--connect-retries|--retry-delay|--max-ocsp-age|--clock-skew|--proxy|--no-proxy|--ca-path|--starttls|--expiry-warn-days|--hosts-file|--parallel)
             option_name=$1
             shift
             [[ $# -gt 0 ]] || { echo "Error: $option_name requires a value." >&2; exit 1; }
             case $option_name in
                 --connect-timeout) connect_timeout=$1 ;;
                 --request-timeout) request_timeout=$1 ;;
+                --connect-retries) connect_retries=$1 ;;
+                --retry-delay) retry_delay=$1 ;;
                 --max-ocsp-age) max_ocsp_age=$1 ;;
                 --clock-skew) clock_skew=$1 ;;
                 --proxy) proxy=$1 ;;
@@ -106,6 +113,8 @@ while (( $# > 0 )); do
         --ca-path=*) ca_path=${1#--ca-path=} ;;
         --connect-timeout=*) connect_timeout=${1#--connect-timeout=} ;;
         --request-timeout=*) request_timeout=${1#--request-timeout=} ;;
+        --connect-retries=*) connect_retries=${1#--connect-retries=} ;;
+        --retry-delay=*) retry_delay=${1#--retry-delay=} ;;
         --max-ocsp-age=*) max_ocsp_age=${1#--max-ocsp-age=} ;;
         --clock-skew=*) clock_skew=${1#--clock-skew=} ;;
         --proxy=*) proxy=${1#--proxy=} ;;
@@ -151,6 +160,14 @@ for setting in connect_timeout request_timeout max_ocsp_age clock_skew; do
 done
 if ! [[ "$expiry_warn_days" =~ ^[0-9]+$ ]]; then
     echo "Error: expiry_warn_days must be a non-negative number of days." >&2
+    exit 1
+fi
+if ! [[ "$connect_retries" =~ ^[0-9]+$ ]]; then
+    echo "Error: --connect-retries must be a non-negative integer." >&2
+    exit 1
+fi
+if ! [[ "$retry_delay" =~ ^[0-9]+$ ]]; then
+    echo "Error: --retry-delay must be a non-negative number of seconds." >&2
     exit 1
 fi
 if ! [[ "$batch_parallel" =~ ^[0-9]+$ ]] || (( batch_parallel < 1 )); then
@@ -392,6 +409,7 @@ check_host() {
     fi
 
     local host_workdir connection_host is_ip sni_args connect_target starttls_args
+    local connect_attempt connect_ok
     local -a warnings=()
     local leaf stapled_ocsp leaf_eku retry_workdir retry_eku status_retry_used=0
     local negotiated_protocol negotiated_cipher
@@ -433,8 +451,20 @@ check_host() {
     [[ -n "$starttls_proto" ]] && starttls_args=(-starttls "$starttls_proto")
 
     echo "Fetching TLS certificate from ${domain}:${port} ...${starttls_proto:+ (STARTTLS: $starttls_proto)}"
-    if ! timeout "$connect_timeout" openssl s_client -connect "$connect_target" "${sni_args[@]}" \
-        "${starttls_args[@]}" -showcerts -status </dev/null >"$host_workdir/s_client.txt" 2>/dev/null; then
+    connect_attempt=0
+    connect_ok=0
+    while :; do
+        if timeout "$connect_timeout" openssl s_client -connect "$connect_target" "${sni_args[@]}" \
+            "${starttls_args[@]}" -showcerts -status </dev/null >"$host_workdir/s_client.txt" 2>/dev/null; then
+            connect_ok=1
+            break
+        fi
+        (( connect_attempt >= connect_retries )) && break
+        connect_attempt=$((connect_attempt + 1))
+        echo "Connection attempt $connect_attempt/$connect_retries failed; retrying in ${retry_delay}s ..." >&2
+        (( retry_delay > 0 )) && sleep "$retry_delay"
+    done
+    if (( connect_ok == 0 )); then
         echo "Error: unable to connect, negotiate STARTTLS, or retrieve the certificate chain." >&2
         emit_error_json "$domain" "$port" "unable to connect, negotiate STARTTLS, or retrieve the certificate chain"
         return 3
