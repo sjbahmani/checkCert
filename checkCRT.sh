@@ -339,6 +339,9 @@ if (( verify_peer == 1 )); then
         [[ "$certificate" == "$leaf" ]] && continue
         awk '{ print }' "$certificate" >> "$chain_bundle"
     done
+    # The server may omit intermediates; if one was recovered via AIA above,
+    # include it too so chain verification is not penalized for that omission.
+    [[ -n "$issuer_cert" ]] && awk '{ print }' "$issuer_cert" >> "$chain_bundle"
     verify_args=(-purpose sslserver)
     if (( is_ip == 1 )); then
         verify_args+=(-verify_ip "$connection_host")
