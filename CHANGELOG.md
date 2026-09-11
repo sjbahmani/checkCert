@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.7.0
+
+- `CA TREE` can now resolve and verify roots that the server didn't present but that are already in the system's default trust store (checked once per run, plus `SSL_CERT_FILE`/`--ca-file`), instead of always showing them as `[NOT PROVIDED]`/`SIGNATURE: UNKNOWN` even when `TRUST` was already correctly `TRUSTED` via that same store.
+- Every `CA TREE` node now tags how it was obtained: `[PRESENTED]`, `[FETCHED VIA AIA]`, or `[FROM LOCAL TRUST STORE]` — previously `[PRESENTED]` was applied to any self-signed root reached, which became misleading once roots could also be resolved locally.
+- A locally-resolved root now also gets a real CRL/OCSP signature check (previously reported "could not be verified" when the true root wasn't presented).
+
 ## 1.6.0
 
 - `FINAL STATUS` and `BATCH SUMMARY` now name the immediate issuing intermediate CA (its common name) before the leaf's own trust/revocation/expiry status, e.g. `ISSUER: Certum OV TLS G2 R39 CA` / `bmi.ir:443 [issuer: Certum OV TLS G2 R39 CA]: leaf certificate is revoked`. Added a matching `"issuer"` field to JSON output (`null` for hosts that never connected).

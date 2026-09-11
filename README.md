@@ -188,11 +188,18 @@ FINAL STATUS
 ```
 
 Immediately before it, `CA TREE` displays the leaf and each cryptographically
-linked CA certificate supplied by the server or retrieved from AIA. An issuer
-marked `[NOT PROVIDED]` was not available to the script; it is not evidence
-that the issuer is trusted. Each displayed certificate includes its individual
-`TRUST` and parent-signature status. Before `CA TREE`, an `ADVISORY WARNINGS`
-section lists every non-fatal issue found (see [Advisory checks](#advisory-checks)),
+linked CA certificate, tagging how each was obtained: `[PRESENTED]` (sent by
+the server), `[FETCHED VIA AIA]` (recovered from the Authority Information
+Access URL), or `[FROM LOCAL TRUST STORE]` (found by exact subject match in
+the system's default CA bundle, `SSL_CERT_FILE`, or `--ca-file` — this is
+also why the main `TRUST` decision can already read `TRUSTED` even when a
+server omits its root: `openssl verify` consults that same store directly).
+An issuer marked `[NOT PROVIDED]` could not be found in any of those places;
+it is not evidence that the issuer is untrusted, only that this script
+couldn't locate a copy of it to display or independently verify its
+signature. Each displayed certificate includes its individual `TRUST` and
+parent-signature status. Before `CA TREE`, an `ADVISORY WARNINGS` section
+lists every non-fatal issue found (see [Advisory checks](#advisory-checks)),
 or `none`.
 
 An `UNKNOWN` result is expected when an endpoint provides no usable CRL/OCSP

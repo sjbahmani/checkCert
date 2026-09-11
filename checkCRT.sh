@@ -9,7 +9,7 @@
 
 set -u -o pipefail
 
-VERSION=1.6.0
+VERSION=1.7.0
 verify_peer=1
 ca_file=
 ca_path=
@@ -180,6 +180,40 @@ fi
 
 workdir=$(mktemp -d "${TMPDIR:-/tmp}/checkcrl.XXXXXX")
 trap 'rm -rf "$workdir"' EXIT
+
+# The main trust decision (openssl verify, no -CAfile) already consults the
+# system's default trust store, which is why TRUST can read TRUSTED even when
+# a server omits its root. The per-host CA TREE walk only searches presented
+# certs and the one AIA-fetched issuer, though, so it can still show a
+# perfectly trusted root as [NOT PROVIDED]/SIGNATURE UNKNOWN. Index the
+# system store (and any --ca-file) once, up front, so every host's tree walk
+# can resolve those roots too, by exact subject match followed by a real
+# signature check. Built once here (not per host) since the store never
+# changes between hosts in a --hosts-file run.
+declare -A system_ca_subjects=()
+system_bundle_files=()
+for system_bundle in "${SSL_CERT_FILE:-}" /etc/ssl/certs/ca-certificates.crt \
+    /etc/pki/tls/certs/ca-bundle.crt /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem \
+    /etc/ssl/cert.pem /usr/local/etc/openssl/cert.pem; do
+    [[ -n "$system_bundle" && -r "$system_bundle" ]] && system_bundle_files+=("$system_bundle")
+done
+system_openssldir=$(openssl version -d 2>/dev/null | sed -n 's/^OPENSSLDIR: "\(.*\)"$/\1/p')
+[[ -n "$system_openssldir" && -r "$system_openssldir/cert.pem" ]] && system_bundle_files+=("$system_openssldir/cert.pem")
+[[ -n "$ca_file" && -r "$ca_file" ]] && system_bundle_files+=("$ca_file")
+if (( ${#system_bundle_files[@]} > 0 )); then
+    : > "$workdir/sysca-combined.pem"
+    cat "${system_bundle_files[@]}" >> "$workdir/sysca-combined.pem" 2>/dev/null
+    awk -v output_dir="$workdir" '
+            /-----BEGIN CERTIFICATE-----/ { number++; file=output_dir "/sysca-" number ".pem"; writing=1 }
+            writing { print > file }
+            /-----END CERTIFICATE-----/ { close(file); writing=0 }
+        ' "$workdir/sysca-combined.pem" 2>/dev/null
+    for sysca_file in "$workdir"/sysca-*.pem; do
+        [[ -e "$sysca_file" ]] || continue
+        sysca_subject=$(openssl x509 -in "$sysca_file" -noout -subject -nameopt RFC2253 2>/dev/null | sed 's/^subject=//')
+        [[ -n "$sysca_subject" ]] && system_ca_subjects["$sysca_subject"]=$sysca_file
+    done
+fi
 
 add_warning() {
     warnings+=("$1")
@@ -569,6 +603,13 @@ check_host() {
                 return 0
             fi
         done
+        if [[ -n "${system_ca_subjects[$expected_issuer]:-}" ]]; then
+            candidate=${system_ca_subjects[$expected_issuer]}
+            if openssl verify -partial_chain -CAfile "$candidate" "$child" >/dev/null 2>&1; then
+                printf '%s\n' "$candidate"
+                return 0
+            fi
+        fi
         return 1
     }
 
@@ -741,7 +782,7 @@ check_host() {
     }
 
     print_ca_tree() {
-        local current=$leaf parent subject issuer label root_suffix revocation_suffix
+        local current=$leaf parent subject issuer label source_suffix='' revocation_suffix
         local signature_status trust_result indent='' child_indent depth=0
         echo "CA TREE"
         while :; do
@@ -750,22 +791,19 @@ check_host() {
             parent=
             if [[ "$subject" == "$issuer" ]]; then
                 label='ROOT CA'
-                root_suffix=' [PRESENTED]'
                 signature_status='SELF-SIGNED'
             elif (( depth == 0 )); then
                 label=CERTIFICATE
-                root_suffix=
                 if parent=$(find_presented_issuer "$current" "$issuer"); then signature_status=VALID; else signature_status=UNKNOWN; fi
             else
                 label=CA
-                root_suffix=
                 if parent=$(find_presented_issuer "$current" "$issuer"); then signature_status=VALID; else signature_status=UNKNOWN; fi
             fi
             if (( depth == 0 )); then trust_result=$trust_status; else trust_result=$(certificate_trust "$current"); fi
             revocation_suffix=
             [[ -n "${revocation_flag[$current]:-}" ]] && revocation_suffix=' [REVOKED]'
             printf '%s└── %s: %s%s%s [TRUST: %s] [SIGNATURE: %s]\n' \
-                "$indent" "$label" "$subject" "$root_suffix" "$revocation_suffix" "$trust_result" "$signature_status"
+                "$indent" "$label" "$subject" "$source_suffix" "$revocation_suffix" "$trust_result" "$signature_status"
             child_indent="${indent}    "
             if [[ "$subject" == "$issuer" ]]; then
                 return
@@ -773,6 +811,13 @@ check_host() {
             if [[ -z "$parent" ]]; then
                 printf '%s└── ISSUER: %s [NOT PROVIDED]\n' "$child_indent" "$issuer"
                 return
+            fi
+            if [[ "$parent" == "$host_workdir"/cert-*.pem ]]; then
+                source_suffix=' [PRESENTED]'
+            elif [[ -n "$issuer_cert" && "$parent" == "$issuer_cert" ]]; then
+                source_suffix=' [FETCHED VIA AIA]'
+            else
+                source_suffix=' [FROM LOCAL TRUST STORE]'
             fi
             indent=$child_indent
             current=$parent
