@@ -236,6 +236,7 @@ emit_error_json() {
     batch_overall=ERROR
     batch_reason=$message
     batch_issuer=
+    batch_days_left=
     [[ "$output_format" == json ]] || return 0
     printf '{"host":"%s","port":%s,"issuer":null,"trust":null,"revocation":null,"expiry":null,"expiry_days_left":null,"intermediate_revoked":null,"stapled_ocsp":null,"overall":"ERROR","exit_code":3,"warnings":[],"error":"%s"}\n' \
         "$(json_escape "$err_domain")" "$err_port" "$(json_escape "$message")" >&3
@@ -818,6 +819,7 @@ check_host() {
     fi
     batch_overall=$overall_status
     batch_reason=$reason
+    batch_days_left=${expiry_days_left:-}
 
     certificate_trust() {
         local certificate=$1
@@ -943,6 +945,7 @@ check_host() {
         printf '  TRUST: %s\n' "$trust_status"
         printf '  REVOCATION: %s\n' "$revocation_status"
         printf '  EXPIRY: %s\n' "$expiry_status"
+        printf '  DAYS REMAINING: %s\n' "${expiry_days_left:-N/A}"
         printf '  OVERALL: %s\n' "$overall_status"
     fi
     return "$exit_code"
@@ -959,14 +962,15 @@ if [[ -n "$hosts_file" ]]; then
 
     batch_total=${#job_hosts[@]}
     batch_worst=0
-    declare -a batch_row_host=() batch_row_overall=() batch_row_issuer=() batch_row_reason=()
+    declare -a batch_row_host=() batch_row_overall=() batch_row_issuer=() batch_row_reason=() batch_row_days_left=()
 
     record_batch_result() {
-        local h=$1 p=$2 rc=$3 overall=${4:-UNKNOWN} reason=${5:-"no reason recorded"} issuer=${6:-}
+        local h=$1 p=$2 rc=$3 overall=${4:-UNKNOWN} reason=${5:-"no reason recorded"} issuer=${6:-} days_left=${7:-}
         batch_row_host+=("${h}:${p}")
         batch_row_overall+=("$overall")
         batch_row_issuer+=("${issuer:-unknown}")
         batch_row_reason+=("$reason")
+        batch_row_days_left+=("${days_left:-N/A}")
         (( rc != 0 )) && batch_worst=1
     }
 
@@ -981,9 +985,10 @@ if [[ -n "$hosts_file" ]]; then
             batch_overall=
             batch_reason=
             batch_issuer=
+            batch_days_left=
             check_host "$batch_host" "$batch_port"
             batch_rc=$?
-            record_batch_result "$batch_host" "$batch_port" "$batch_rc" "$batch_overall" "$batch_reason" "$batch_issuer"
+            record_batch_result "$batch_host" "$batch_port" "$batch_rc" "$batch_overall" "$batch_reason" "$batch_issuer" "$batch_days_left"
         done
     else
         declare -a job_logs=() job_results=() active_pids=() active_idx=()
@@ -1001,9 +1006,10 @@ if [[ -n "$hosts_file" ]]; then
                     batch_overall=
                     batch_reason=
                     batch_issuer=
+                    batch_days_left=
                     check_host "$batch_host" "$batch_port"
                     batch_rc=$?
-                    printf '%s\t%s\t%s\t%s\n' "$batch_rc" "$batch_overall" "$batch_reason" "$batch_issuer" > "${job_results[$job_idx]}"
+                    printf '%s\t%s\t%s\t%s\t%s\n' "$batch_rc" "$batch_overall" "$batch_reason" "$batch_issuer" "$batch_days_left" > "${job_results[$job_idx]}"
                 } >"${job_logs[$job_idx]}" 2>&1
             ) &
             active_pids+=("$!")
@@ -1029,8 +1035,9 @@ if [[ -n "$hosts_file" ]]; then
             batch_overall=
             batch_reason=
             batch_issuer=
-            IFS=$'\t' read -r batch_rc batch_overall batch_reason batch_issuer < "${job_results[$job_idx]}"
-            record_batch_result "${job_hosts[$job_idx]}" "${job_ports[$job_idx]}" "${batch_rc:-3}" "$batch_overall" "$batch_reason" "$batch_issuer"
+            batch_days_left=
+            IFS=$'\t' read -r batch_rc batch_overall batch_reason batch_issuer batch_days_left < "${job_results[$job_idx]}"
+            record_batch_result "${job_hosts[$job_idx]}" "${job_ports[$job_idx]}" "${batch_rc:-3}" "$batch_overall" "$batch_reason" "$batch_issuer" "$batch_days_left"
         done
     fi
 
@@ -1068,17 +1075,19 @@ if [[ -n "$hosts_file" ]]; then
             fi
         done
 
-        # Column widths: HOST/STATUS/ISSUER size to their widest value (ISSUER
-        # capped, longer values are shown truncated with an ellipsis); REASON
-        # is last and left unpadded so it isn't cut off.
+        # Column widths: HOST/STATUS/ISSUER/DAYS LEFT size to their widest
+        # value (ISSUER capped, longer values are shown truncated with an
+        # ellipsis); REASON is last and left unpadded so it isn't cut off.
         batch_issuer_cap=42
         declare -a batch_issuer_disp=()
         batch_host_w=4
         batch_status_w=6
         batch_issuer_w=6
+        batch_days_w=9
         for batch_i in "${!batch_row_host[@]}"; do
             (( ${#batch_row_host[$batch_i]} > batch_host_w )) && batch_host_w=${#batch_row_host[$batch_i]}
             (( ${#batch_row_overall[$batch_i]} > batch_status_w )) && batch_status_w=${#batch_row_overall[$batch_i]}
+            (( ${#batch_row_days_left[$batch_i]} > batch_days_w )) && batch_days_w=${#batch_row_days_left[$batch_i]}
             batch_disp=${batch_row_issuer[$batch_i]}
             if (( ${#batch_disp} > batch_issuer_cap )); then
                 batch_disp="${batch_disp:0:$((batch_issuer_cap - 1))}…"
@@ -1090,18 +1099,20 @@ if [[ -n "$hosts_file" ]]; then
         echo
         echo "BATCH SUMMARY (${batch_total} host(s) checked)"
         echo
-        printf '  %-*s  %-*s  %-*s  %s\n' \
-            "$batch_status_w" STATUS "$batch_host_w" HOST "$batch_issuer_w" ISSUER REASON
-        printf '  %s  %s  %s  %s\n' \
+        printf '  %-*s  %-*s  %-*s  %*s  %s\n' \
+            "$batch_status_w" STATUS "$batch_host_w" HOST "$batch_issuer_w" ISSUER "$batch_days_w" "DAYS LEFT" REASON
+        printf '  %s  %s  %s  %s  %s\n' \
             "$(printf '%*s' "$batch_status_w" '' | tr ' ' '-')" \
             "$(printf '%*s' "$batch_host_w" '' | tr ' ' '-')" \
             "$(printf '%*s' "$batch_issuer_w" '' | tr ' ' '-')" \
+            "$(printf '%*s' "$batch_days_w" '' | tr ' ' '-')" \
             "$(printf '%*s' 6 '' | tr ' ' '-')"
         for batch_i in "${batch_order[@]}"; do
-            printf '  %-*s  %-*s  %-*s  %s\n' \
+            printf '  %-*s  %-*s  %-*s  %*s  %s\n' \
                 "$batch_status_w" "${batch_row_overall[$batch_i]}" \
                 "$batch_host_w" "${batch_row_host[$batch_i]}" \
                 "$batch_issuer_w" "${batch_issuer_disp[$batch_i]}" \
+                "$batch_days_w" "${batch_row_days_left[$batch_i]}" \
                 "${batch_row_reason[$batch_i]}"
         done
     fi
