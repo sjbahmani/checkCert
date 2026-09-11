@@ -185,6 +185,8 @@ json_escape() {
 # one line per host attempted instead of that host silently disappearing.
 emit_error_json() {
     local err_domain=$1 err_port=$2 message=$3
+    batch_overall=ERROR
+    batch_reason=$message
     [[ "$output_format" == json ]] || return 0
     printf '{"host":"%s","port":%s,"trust":null,"revocation":null,"expiry":null,"expiry_days_left":null,"intermediate_revoked":null,"stapled_ocsp":null,"overall":"ERROR","exit_code":3,"warnings":[],"error":"%s"}\n' \
         "$(json_escape "$err_domain")" "$err_port" "$(json_escape "$message")" >&3
@@ -357,7 +359,7 @@ check_host() {
     local ci cert subj iss verifier
     local checked=0 revoked=0 ocsp_good=0
     local rc_checked rc_revoked rc_ocsp_good
-    local trust_status expiry_status revocation_status overall_status exit_code
+    local trust_status expiry_status revocation_status overall_status exit_code reason
     local caa_records
 
     host_workdir=$(mktemp -d "$workdir/host.XXXXXX")
@@ -666,24 +668,42 @@ check_host() {
     if (( revoked == 1 || intermediate_revoked == 1 )); then
         overall_status=REVOKED
         exit_code=2
+        if (( revoked == 1 && intermediate_revoked == 1 )); then
+            reason="leaf certificate and an intermediate CA are both revoked"
+        elif (( revoked == 1 )); then
+            reason="leaf certificate is revoked"
+        else
+            reason="an intermediate CA in the chain is revoked"
+        fi
     elif (( certificate_expired == 1 )); then
         overall_status=EXPIRED
         exit_code=4
+        reason="certificate has expired"
     elif (( peer_valid != 1 )); then
         overall_status=UNTRUSTED/INVALID
         exit_code=5
+        reason="certificate chain or hostname/IP verification failed"
     elif [[ "$revocation_status" == 'NOT REVOKED' ]]; then
         if (( fail_on_expiry_warning == 1 && expiry_warning == 1 )); then
             overall_status='VALID (EXPIRING SOON)'
             exit_code=6
+            reason="trusted and not revoked, but expires in $expiry_days_left day(s)"
         else
             overall_status=VALID
             exit_code=0
+            if (( expiry_warning == 1 )); then
+                reason="trusted and not revoked, but expires in $expiry_days_left day(s)"
+            else
+                reason="trusted, not revoked, not expiring soon"
+            fi
         fi
     else
         overall_status=UNKNOWN
         exit_code=3
+        reason="no verifiable CRL/OCSP revocation data available"
     fi
+    batch_overall=$overall_status
+    batch_reason=$reason
 
     certificate_trust() {
         local certificate=$1
@@ -776,7 +796,9 @@ check_host() {
 
 if [[ -n "$hosts_file" ]]; then
     batch_worst=0
-    batch_results=()
+    batch_total=0
+    declare -A batch_group_lines=()
+    declare -a batch_group_order=()
     while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
         read -r batch_host batch_port _ <<<"$raw_line"
         [[ -z "$batch_host" || "$batch_host" == \#* ]] && continue
@@ -785,15 +807,40 @@ if [[ -n "$hosts_file" ]]; then
         echo "############################################################"
         echo "### ${batch_host}:${batch_port}"
         echo "############################################################"
+        batch_overall=
+        batch_reason=
         check_host "$batch_host" "$batch_port"
         batch_rc=$?
-        batch_results+=("${batch_host}:${batch_port} exit=${batch_rc}")
+        batch_total=$((batch_total + 1))
+        batch_overall=${batch_overall:-UNKNOWN}
+        batch_reason=${batch_reason:-"no reason recorded"}
+        [[ -n "${batch_group_lines[$batch_overall]+x}" ]] || batch_group_order+=("$batch_overall")
+        batch_group_lines["$batch_overall"]+="  ${batch_host}:${batch_port}: ${batch_reason}"$'\n'
         (( batch_rc != 0 )) && batch_worst=1
     done < "$hosts_file"
     if [[ "$output_format" != json ]]; then
+        # Problems first, then healthy results; anything unforeseen falls
+        # back to the order categories were first seen.
+        batch_priority=(REVOKED EXPIRED "UNTRUSTED/INVALID" ERROR UNKNOWN "VALID (EXPIRING SOON)" VALID)
+        batch_display_order=()
+        for batch_cat in "${batch_priority[@]}"; do
+            [[ -n "${batch_group_lines[$batch_cat]+x}" ]] && batch_display_order+=("$batch_cat")
+        done
+        for batch_cat in "${batch_group_order[@]}"; do
+            batch_seen=0
+            for batch_done in "${batch_display_order[@]}"; do
+                [[ "$batch_done" == "$batch_cat" ]] && { batch_seen=1; break; }
+            done
+            (( batch_seen == 0 )) && batch_display_order+=("$batch_cat")
+        done
         echo
-        echo "BATCH SUMMARY"
-        printf '  %s\n' "${batch_results[@]}"
+        echo "BATCH SUMMARY (${batch_total} host(s) checked)"
+        for batch_cat in "${batch_display_order[@]}"; do
+            batch_count=$(grep -c '.' <<<"${batch_group_lines[$batch_cat]}")
+            echo
+            echo "${batch_cat} (${batch_count})"
+            printf '%s' "${batch_group_lines[$batch_cat]}"
+        done
     fi
     exit "$batch_worst"
 else
