@@ -42,6 +42,14 @@ Iran's national PKI:
 ./checkCRT.sh --ca-file examples/iran-root-ca.pem bankmellat.ir
 ```
 
+A ready-made `--hosts-file`, `examples/hosts-iran.txt`, covers major Iranian
+banks, marketplaces, telecoms, crypto exchanges, cloud providers, and
+government sites, plus `google.com` as a non-Iranian baseline:
+
+```bash
+./checkCRT.sh --hosts-file examples/hosts-iran.txt
+```
+
 `--json` reserves standard output for one JSON object; progress and diagnostic
 messages are written to standard error. This makes it suitable for monitoring:
 
