@@ -16,7 +16,7 @@ ca_path=
 output_format=text
 connect_timeout=20
 request_timeout=45
-connect_retries=2
+connect_retries=4
 retry_delay=3
 max_ocsp_age=86400
 clock_skew=300
@@ -45,7 +45,7 @@ Options:
   --connect-timeout N TLS connection timeout in seconds (default: 20).
   --request-timeout N CRL/OCSP request timeout in seconds (default: 45).
   --connect-retries N Retry the initial TLS connection up to N extra times
-                      on failure (default: 2; 0 disables retrying).
+                      on failure (default: 4; 0 disables retrying).
   --retry-delay N     Seconds to wait between connection retries (default: 3).
   --max-ocsp-age N    Maximum OCSP response age in seconds (default: 86400).
   --clock-skew N      Allowed clock skew for OCSP in seconds (default: 300).

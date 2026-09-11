@@ -180,7 +180,7 @@ through an HTTP proxy.
 
 If the initial TLS connection fails (transient network blips, filtering,
 etc.), it's retried automatically — `--connect-retries` sets how many extra
-attempts to make (default 2; `0` disables retrying) and `--retry-delay` sets
+attempts to make (default 4; `0` disables retrying) and `--retry-delay` sets
 the pause between attempts in seconds (default 3). This applies per host, so
 in `--hosts-file` batch mode each host gets its own retries.
 
