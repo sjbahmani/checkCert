@@ -14,7 +14,7 @@ verify_peer=1
 ca_file=
 ca_path=
 output_format=text
-connect_timeout=20
+connect_timeout=5
 request_timeout=45
 connect_retries=4
 retry_delay=3
@@ -42,7 +42,7 @@ Options:
   --ca-path DIR       Directory of hashed CA certificates for verification.
   --json              Write the final status as JSON to standard output
                       (one object per host, newline-delimited in batch mode).
-  --connect-timeout N TLS connection timeout in seconds (default: 20).
+  --connect-timeout N TLS connection timeout in seconds (default: 5).
   --request-timeout N CRL/OCSP request timeout in seconds (default: 45).
   --connect-retries N Retry the initial TLS connection up to N extra times
                       on failure (default: 4; 0 disables retrying).
