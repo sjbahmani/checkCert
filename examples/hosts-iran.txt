@@ -70,7 +70,6 @@ nobitex.ir
 exir.io
 ramzinex.com
 tabdeal.org
-excoino.com
 ok-ex.io
 tetherland.com
 arzdigital.com
@@ -95,7 +94,7 @@ intamedia.ir
 adliran.ir
 eadl.ir
 behdasht.gov.ir
-medu.ir
+my.medu.ir
 iribonline.ir
 tamin.ir
 sejam.ir
