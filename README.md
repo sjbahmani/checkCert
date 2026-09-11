@@ -85,10 +85,11 @@ finishes, but always in the file's original order — so results stay
 readable and easy to scan even though hosts may finish out of order (NDJSON
 lines in `--json` mode, however, are written in *completion* order, not
 input order, since they stream live as each host finishes). After the
-per-host reports, `BATCH SUMMARY` lists every host as a table — rows ordered
+per-host reports, `BATCH SUMMARY` lists every host as a table — rows grouped
 problems first (`REVOKED`, `EXPIRED`, `UNTRUSTED/INVALID`, `ERROR`,
-`UNKNOWN`), then `VALID` — with the immediate issuing CA and a
-plain-language reason instead of a bare exit code:
+`UNKNOWN`), then `VALID`, and alphabetized by host within each group — with
+the immediate issuing CA and a plain-language reason instead of a bare exit
+code:
 
 ```text
 BATCH SUMMARY (4 host(s) checked)

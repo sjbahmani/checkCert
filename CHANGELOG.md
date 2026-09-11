@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.10.1
+
+- `BATCH SUMMARY` rows are now alphabetized by host within each status group (previously input-file order).
+
 ## 1.10.0
 
 - `BATCH SUMMARY` is now rendered as an aligned table (STATUS, HOST, ISSUER, REASON columns) instead of per-category text blocks; rows are still ordered problems-first (REVOKED, EXPIRED, UNTRUSTED/INVALID, ERROR, UNKNOWN, then VALID). The ISSUER column truncates past 42 characters with `…`; REASON is never truncated.

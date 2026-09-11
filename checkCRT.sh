@@ -9,7 +9,7 @@
 
 set -u -o pipefail
 
-VERSION=1.10.0
+VERSION=1.10.1
 verify_peer=1
 ca_file=
 ca_path=
@@ -1035,21 +1035,37 @@ if [[ -n "$hosts_file" ]]; then
     fi
 
     if [[ "$output_format" != json ]]; then
-        # Problems first, then healthy results, each group in the order its
-        # hosts were checked; anything unforeseen falls back to first-seen.
+        # Problems first, then healthy results; hosts within each group are
+        # sorted alphabetically. Anything unforeseen falls back to first-seen
+        # category order, appended after the known ones.
         batch_priority=(REVOKED EXPIRED "UNTRUSTED/INVALID" ERROR UNKNOWN "VALID (EXPIRING SOON)" VALID)
-        declare -a batch_order=()
-        for batch_cat in "${batch_priority[@]}"; do
-            for batch_i in "${!batch_row_overall[@]}"; do
-                [[ "${batch_row_overall[$batch_i]}" == "$batch_cat" ]] && batch_order+=("$batch_i")
+        declare -a batch_order=() batch_seen_cats=("${batch_priority[@]}")
+
+        batch_append_sorted_category() {
+            local cat=$1 i
+            local -a pairs=()
+            for i in "${!batch_row_overall[@]}"; do
+                [[ "${batch_row_overall[$i]}" == "$cat" ]] && pairs+=("${batch_row_host[$i]}"$'\t'"$i")
             done
+            (( ${#pairs[@]} == 0 )) && return
+            while IFS=$'\t' read -r _ batch_sorted_i; do
+                batch_order+=("$batch_sorted_i")
+            done < <(printf '%s\n' "${pairs[@]}" | sort -t $'\t' -k1,1)
+        }
+
+        for batch_cat in "${batch_priority[@]}"; do
+            batch_append_sorted_category "$batch_cat"
         done
         for batch_i in "${!batch_row_overall[@]}"; do
+            batch_cat=${batch_row_overall[$batch_i]}
             batch_seen=0
-            for batch_j in "${batch_order[@]:-}"; do
-                [[ "$batch_j" == "$batch_i" ]] && { batch_seen=1; break; }
+            for batch_done_cat in "${batch_seen_cats[@]}"; do
+                [[ "$batch_done_cat" == "$batch_cat" ]] && { batch_seen=1; break; }
             done
-            (( batch_seen == 0 )) && batch_order+=("$batch_i")
+            if (( batch_seen == 0 )); then
+                batch_seen_cats+=("$batch_cat")
+                batch_append_sorted_category "$batch_cat"
+            fi
         done
 
         # Column widths: HOST/STATUS/ISSUER size to their widest value (ISSUER
