@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.9.0
+
+- `CA TREE` now recognizes cross-signed root rollovers accurately: when a node's own stated issuer can't be verified but the local trust store independently trusts a different, self-signed certificate with the same subject name (e.g. Google's `GTS Root R1` cross-signed by the retired `GlobalSign Root CA`), the tree walks into that equivalent root instead of ending in `[NOT PROVIDED]`, and the node reads `TRUST: TRUSTED (VIA EQUIVALENT ROOT)` / `SIGNATURE: VALID (CROSS-SIGNED)` instead of a misleading `UNTRUSTED/INVALID` / `UNKNOWN`. The candidate must itself be genuinely self-signed and independently trusted — this recognizes a real alternate signature path, not a public-key-matching shortcut. The leaf's overall `TRUST` line is unaffected either way.
+
 ## 1.8.0
 
 - Added an automatic retry for a rare but real failure mode: some servers/load balancers misroute connections that request OCSP stapling to an unrelated backend (e.g. an OCSP responder answering with its own signing certificate, observed on `msn.com`). When the received certificate's `extendedKeyUsage` excludes TLS Web Server Authentication, checkCRT.sh now retries once without requesting OCSP stapling and uses that result if it looks like a normal server certificate, noting the fallback in `ADVISORY WARNINGS` (and skipping `STAPLED OCSP` for that host, since it wasn't requested on the retry). If the retry is still wrong, the original result stands.

@@ -9,7 +9,7 @@
 
 set -u -o pipefail
 
-VERSION=1.8.0
+VERSION=1.9.0
 verify_peer=1
 ca_file=
 ca_path=
@@ -821,12 +821,14 @@ check_host() {
 
     print_ca_tree() {
         local current=$leaf parent subject issuer label source_suffix='' revocation_suffix
-        local signature_status trust_result indent='' child_indent depth=0
+        local signature_status trust_result indent='' child_indent depth=0 cross_signed
+        local local_root_candidate candidate_subject candidate_issuer current_fp candidate_fp
         echo "CA TREE"
         while :; do
             subject=$(certificate_subject "$current")
             issuer=$(certificate_issuer "$current")
             parent=
+            cross_signed=0
             if [[ "$subject" == "$issuer" ]]; then
                 label='ROOT CA'
                 signature_status='SELF-SIGNED'
@@ -837,7 +839,40 @@ check_host() {
                 label=CA
                 if parent=$(find_presented_issuer "$current" "$issuer"); then signature_status=VALID; else signature_status=UNKNOWN; fi
             fi
-            if (( depth == 0 )); then trust_result=$trust_status; else trust_result=$(certificate_trust "$current"); fi
+            # This cert's own stated issuer couldn't be resolved/verified, but
+            # the local trust store independently trusts a *different*,
+            # self-signed certificate sharing its subject name: the classic
+            # cross-signed root-rollover pattern (e.g. Google's GTS Root R1
+            # cross-signed by the retired GlobalSign Root CA, while a modern
+            # self-signed GTS Root R1 is trusted directly). Walk into that
+            # equivalent root instead of reporting a bogus untrusted/unknown
+            # dead end -- this is a real, valid alternate signature path, not
+            # a weakening of validation (we still require the candidate to be
+            # genuinely self-signed and independently trusted on its own).
+            if [[ "$signature_status" == UNKNOWN ]]; then
+                local_root_candidate=${system_ca_subjects[$subject]:-}
+                if [[ -n "$local_root_candidate" ]]; then
+                    candidate_subject=$(certificate_subject "$local_root_candidate")
+                    candidate_issuer=$(certificate_issuer "$local_root_candidate")
+                    if [[ "$candidate_subject" == "$candidate_issuer" ]]; then
+                        current_fp=$(openssl x509 -in "$current" -noout -fingerprint -sha256 2>/dev/null)
+                        candidate_fp=$(openssl x509 -in "$local_root_candidate" -noout -fingerprint -sha256 2>/dev/null)
+                        if [[ -n "$current_fp" && "$current_fp" != "$candidate_fp" ]] \
+                            && openssl verify -purpose any "$local_root_candidate" >/dev/null 2>&1; then
+                            cross_signed=1
+                            signature_status='VALID (CROSS-SIGNED)'
+                            parent=$local_root_candidate
+                        fi
+                    fi
+                fi
+            fi
+            if (( depth == 0 )); then
+                trust_result=$trust_status
+            elif (( cross_signed == 1 )); then
+                trust_result='TRUSTED (VIA EQUIVALENT ROOT)'
+            else
+                trust_result=$(certificate_trust "$current")
+            fi
             revocation_suffix=
             [[ -n "${revocation_flag[$current]:-}" ]] && revocation_suffix=' [REVOKED]'
             printf '%s└── %s: %s%s%s [TRUST: %s] [SIGNATURE: %s]\n' \

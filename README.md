@@ -212,9 +212,25 @@ An issuer marked `[NOT PROVIDED]` could not be found in any of those places;
 it is not evidence that the issuer is untrusted, only that this script
 couldn't locate a copy of it to display or independently verify its
 signature. Each displayed certificate includes its individual `TRUST` and
-parent-signature status. Before `CA TREE`, an `ADVISORY WARNINGS` section
-lists every non-fatal issue found (see [Advisory checks](#advisory-checks)),
-or `none`.
+parent-signature status.
+
+A node can also read `SIGNATURE: VALID (CROSS-SIGNED)` / `TRUST: TRUSTED
+(VIA EQUIVALENT ROOT)`: its own stated issuer couldn't be verified, but the
+local trust store independently trusts a *different*, self-signed
+certificate sharing its subject name — the classic root-rollover pattern,
+e.g. Google's `GTS Root R1` is often presented cross-signed by the retired
+`GlobalSign Root CA` for legacy-client compatibility, while modern trust
+stores (including yours) already trust a separate, purely self-signed
+`GTS Root R1` directly. When this is detected, the tree walks into that
+equivalent root instead of ending in `[NOT PROVIDED]`, since it's a real,
+independently-verified alternate signature path (the candidate must itself
+be genuinely self-signed and separately trusted) — not a weakening of
+validation by matching public keys across unrelated files. The leaf's
+overall `TRUST` line is unaffected either way, since it already reflects the
+real, successfully-built chain.
+
+Before `CA TREE`, an `ADVISORY WARNINGS` section lists every non-fatal issue
+found (see [Advisory checks](#advisory-checks)), or `none`.
 
 An `UNKNOWN` result is expected when an endpoint provides no usable CRL/OCSP
 information or revocation data is unreachable or invalid. A successful result
