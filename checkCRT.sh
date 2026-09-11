@@ -15,7 +15,7 @@ ca_file=
 ca_path=
 output_format=text
 connect_timeout=5
-request_timeout=45
+request_timeout=20
 connect_retries=4
 retry_delay=3
 max_ocsp_age=86400
@@ -43,7 +43,7 @@ Options:
   --json              Write the final status as JSON to standard output
                       (one object per host, newline-delimited in batch mode).
   --connect-timeout N TLS connection timeout in seconds (default: 5).
-  --request-timeout N CRL/OCSP request timeout in seconds (default: 45).
+  --request-timeout N CRL/OCSP request timeout in seconds (default: 20).
   --connect-retries N Retry the initial TLS connection up to N extra times
                       on failure (default: 4; 0 disables retrying).
   --retry-delay N     Seconds to wait between connection retries (default: 3).
