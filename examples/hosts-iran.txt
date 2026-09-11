@@ -23,7 +23,8 @@ bsi.ir
 bank-maskan.ir
 tejaratbank.ir
 postbank.ir
-refah-bank.ir
+#refah-bank.ir
+rb24.ir
 parsian-bank.ir
 bank-melli.ir
 baambank.ir
