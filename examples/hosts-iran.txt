@@ -21,6 +21,7 @@ bank-maskan.ir
 tejaratbank.ir
 postbank.ir
 refah-bank.ir
+parsian-bank.ir
 
 # Marketplace / ride-hailing / e-commerce
 divar.ir
@@ -36,6 +37,10 @@ mci.ir
 bitpin.ir
 wallex.ir
 nobitex.ir
+exir.io
+ramzinex.com
+tabdeal.org
+excoino.com
 
 # Cloud providers
 arvancloud.ir
@@ -52,6 +57,9 @@ majlis.ir
 aparat.com
 varzesh3.com
 irna.ir
+farsnews.ir
+mehrnews.com
+yjc.ir
 
 # Baseline (non-Iranian, for comparison)
 google.com
