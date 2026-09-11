@@ -676,10 +676,28 @@ check_host() {
         local child=$1 expected_issuer=$2 candidate candidate_subject
         local -a candidates=("$host_workdir"/cert-*.pem)
         [[ -n "$issuer_cert" ]] && candidates+=("$issuer_cert")
+        # Self-signed candidates are tried last: during a root rollover a
+        # server can present a same-named self-signed root alongside a
+        # cross-signed sibling that continues the chain to a root actually
+        # in the trust store, and both will pass this signature check (they
+        # share the same key). Preferring the chain-extending candidate
+        # means the walk reaches the real, trusted root instead of stopping
+        # early at a same-named dead end.
+        local -a self_signed_candidates=()
         for candidate in "${candidates[@]}"; do
             [[ "$candidate" == "$child" ]] && continue
             candidate_subject=$(certificate_subject "$candidate")
             [[ "$candidate_subject" == "$expected_issuer" ]] || continue
+            if [[ "$candidate_subject" == "$(certificate_issuer "$candidate")" ]]; then
+                self_signed_candidates+=("$candidate")
+                continue
+            fi
+            if openssl verify -partial_chain -CAfile "$candidate" "$child" >/dev/null 2>&1; then
+                printf '%s\n' "$candidate"
+                return 0
+            fi
+        done
+        for candidate in "${self_signed_candidates[@]}"; do
             if openssl verify -partial_chain -CAfile "$candidate" "$child" >/dev/null 2>&1; then
                 printf '%s\n' "$candidate"
                 return 0
@@ -702,6 +720,18 @@ check_host() {
         : > "$chain_bundle"
         for cert in "$host_workdir"/cert-*.pem; do
             [[ "$cert" == "$leaf" ]] && continue
+            # A self-signed cert in the "-untrusted" pool never usefully
+            # extends the chain: it's either already a trusted root (found
+            # independently via the CA store, not via this bundle) or a dead
+            # end. Worse, during a root rollover a server may present both a
+            # not-yet-trusted self-signed root and a cross-signed sibling
+            # with the *same* subject/key; OpenSSL's chain builder locks onto
+            # whichever one it meets first in this bundle and won't backtrack,
+            # so a self-signed dead end here can hide a genuinely trusted
+            # cross-signed path. Excluding self-signed certs avoids that trap.
+            if [[ "$(certificate_subject "$cert")" == "$(certificate_issuer "$cert")" ]]; then
+                continue
+            fi
             awk '{ print }' "$cert" >> "$chain_bundle"
         done
         # The server may omit intermediates; if one was recovered via AIA above,
