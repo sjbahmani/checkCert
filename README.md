@@ -8,8 +8,10 @@ distribution points and OCSP.
 
 Linux or another environment with Bash 4+, OpenSSL, `curl` or `wget`, GNU
 `timeout`, `date`, `awk`, `sed`, `grep`, `sort`, `tr`, and `mktemp`. LDAP CRL
-URLs are not supported because they cannot be fetched by `curl`/`wget` in this
-script.
+and AIA issuer URLs are detected and skipped with a clear message, since they
+cannot be fetched by `curl`/`wget` in this script. `dig`, `host`, or
+`nslookup` (any one of them) is required for the CAA record lookup; the
+lookup is skipped, not fatal, when none are installed.
 
 ## Usage
 
@@ -20,6 +22,9 @@ script.
 ./checkCRT.sh 2001:db8::10 443
 ./checkCRT.sh --json example.com
 ./checkCRT.sh --proxy http://proxy.example:8080 --no-proxy localhost example.com
+./checkCRT.sh --starttls smtp mail.example.com 587
+./checkCRT.sh --expiry-warn-days 14 example.com
+./checkCRT.sh --no-caa internal.example
 ```
 
 The script always validates the chain and the supplied hostname (or IP address)
@@ -32,8 +37,42 @@ result does not guarantee identical treatment by every browser.
 messages are written to standard error. This makes it suitable for monitoring:
 
 ```json
-{"host":"example.com","port":443,"trust":"TRUSTED","revocation":"NOT REVOKED","expiry":"NOT EXPIRED","stapled_ocsp":"NOT STAPLED","overall":"VALID","exit_code":0}
+{"host":"example.com","port":443,"trust":"TRUSTED","revocation":"NOT REVOKED","expiry":"NOT EXPIRED","expiry_days_left":46,"stapled_ocsp":"NOT STAPLED","overall":"VALID","exit_code":0,"warnings":[]}
 ```
+
+## STARTTLS
+
+Use `--starttls PROTO` to check mail and other protocols that upgrade a plain
+connection to TLS instead of connecting directly, e.g.
+`--starttls smtp mail.example.com 587` or `--starttls imap mail.example.com 143`.
+Supported values come from the local OpenSSL build's `s_client -starttls`
+(typically `smtp`, `imap`, `pop3`, `ftp`, `nntp`, `ldap`, `xmpp`/`xmpp-server`,
+`postgres`, `mysql`, `lmtp`, `irc`, `sieve`).
+
+## Advisory checks
+
+Beyond trust/expiry/revocation, every run also reports and collects into a
+non-fatal `ADVISORY WARNINGS` list (and the JSON `warnings` array):
+
+- **Expiry warning** — `--expiry-warn-days N` (default 30; `0` disables it)
+  flags certificates expiring soon. `EXPIRY` can now report `EXPIRING SOON` in
+  addition to `NOT EXPIRED`/`EXPIRED`; this does not change the exit code.
+- **Weak cryptography** — deprecated TLS protocol versions/ciphers negotiated
+  on the connection, MD5/SHA-1 certificate signatures, and undersized RSA/DSA
+  (< 2048 bit) or EC (< 224 bit) public keys.
+- **Key usage / EKU** — flags a certificate whose `extendedKeyUsage`
+  extension is present but omits TLS Web Server Authentication.
+- **Certificate Transparency** — reports whether an SCT is embedded in the
+  certificate or present via the TLS extension (presence only; log signatures
+  are not independently verified).
+- **CAA records** — looks up DNS `CAA` records at the exact hostname using
+  `dig`, `host`, or `nslookup` (whichever is available); skipped for IP
+  targets, when none of those tools are present, or with `--no-caa`. Parent
+  domains are not walked, so an empty result is not proof that any CA may
+  issue.
+
+These checks are informational: they never change `TRUST`, `REVOCATION`, or
+the exit code, since browsers and CAs vary in how strictly they enforce them.
 
 ## Revocation checks
 
@@ -66,7 +105,7 @@ Every completed check ends with this machine-readable, uppercase summary:
 FINAL STATUS
   TRUST: TRUSTED | UNTRUSTED/INVALID
   REVOCATION: NOT REVOKED | REVOKED | UNKNOWN
-  EXPIRY: NOT EXPIRED | EXPIRED
+  EXPIRY: NOT EXPIRED | EXPIRING SOON | EXPIRED
   OVERALL: VALID | REVOKED | EXPIRED | UNTRUSTED/INVALID | UNKNOWN
 ```
 
@@ -74,7 +113,9 @@ Immediately before it, `CA TREE` displays the leaf and each cryptographically
 linked CA certificate supplied by the server or retrieved from AIA. An issuer
 marked `[NOT PROVIDED]` was not available to the script; it is not evidence
 that the issuer is trusted. Each displayed certificate includes its individual
-`TRUST` and parent-signature status.
+`TRUST` and parent-signature status. Before `CA TREE`, an `ADVISORY WARNINGS`
+section lists every non-fatal issue found (see [Advisory checks](#advisory-checks)),
+or `none`.
 
 An `UNKNOWN` result is expected when an endpoint provides no usable CRL/OCSP
 information or revocation data is unreachable or invalid. A successful result

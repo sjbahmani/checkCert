@@ -5,7 +5,7 @@
 
 set -u -o pipefail
 
-VERSION=1.2.0
+VERSION=1.3.0
 verify_peer=1
 peer_valid=0
 ca_file=
@@ -17,7 +17,11 @@ max_ocsp_age=86400
 clock_skew=300
 proxy=
 no_proxy=
+starttls_proto=
+expiry_warn_days=30
+check_caa=1
 positionals=()
+warnings=()
 
 usage() {
     cat <<EOF
@@ -35,6 +39,11 @@ Options:
   --clock-skew N      Allowed clock skew for OCSP in seconds (default: 300).
   --proxy URL         HTTP(S) proxy for CRL/OCSP HTTP requests.
   --no-proxy HOSTS    Comma-separated hosts that bypass the proxy.
+  --starttls PROTO    Negotiate STARTTLS before the TLS handshake (e.g. smtp,
+                      imap, pop3, ftp, nntp, ldap, xmpp, postgres, mysql).
+  --expiry-warn-days N Warn when the certificate expires within N days
+                      (default: 30; 0 disables the warning).
+  --no-caa            Skip the DNS CAA record lookup.
   -h, --help          Show this help.
   --version           Show the version.
 EOF
@@ -46,7 +55,8 @@ while (( $# > 0 )); do
         --version) printf '%s %s\n' "${0##*/}" "$VERSION"; exit 0 ;;
         --verify-peer) verify_peer=1 ;;
         --json) output_format=json ;;
-        --connect-timeout|--request-timeout|--max-ocsp-age|--clock-skew|--proxy|--no-proxy|--ca-path)
+        --no-caa) check_caa=0 ;;
+        --connect-timeout|--request-timeout|--max-ocsp-age|--clock-skew|--proxy|--no-proxy|--ca-path|--starttls|--expiry-warn-days)
             option_name=$1
             shift
             [[ $# -gt 0 ]] || { echo "Error: $option_name requires a value." >&2; exit 1; }
@@ -58,6 +68,8 @@ while (( $# > 0 )); do
                 --proxy) proxy=$1 ;;
                 --no-proxy) no_proxy=$1 ;;
                 --ca-path) ca_path=$1 ;;
+                --starttls) starttls_proto=$1 ;;
+                --expiry-warn-days) expiry_warn_days=$1 ;;
             esac
             ;;
         --ca-file)
@@ -73,6 +85,8 @@ while (( $# > 0 )); do
         --clock-skew=*) clock_skew=${1#--clock-skew=} ;;
         --proxy=*) proxy=${1#--proxy=} ;;
         --no-proxy=*) no_proxy=${1#--no-proxy=} ;;
+        --starttls=*) starttls_proto=${1#--starttls=} ;;
+        --expiry-warn-days=*) expiry_warn_days=${1#--expiry-warn-days=} ;;
         --) shift; positionals+=("$@"); break ;;
         -*) echo "Error: unknown option: $1" >&2; usage; exit 1 ;;
         *) positionals+=("$1") ;;
@@ -102,11 +116,21 @@ for setting in connect_timeout request_timeout max_ocsp_age clock_skew; do
         exit 1
     fi
 done
+if ! [[ "$expiry_warn_days" =~ ^[0-9]+$ ]]; then
+    echo "Error: expiry_warn_days must be a non-negative number of days." >&2
+    exit 1
+fi
 for command in openssl awk sed grep mktemp timeout tr sort date; do
     command -v "$command" >/dev/null 2>&1 || {
         echo "Error: '$command' is required." >&2; exit 3;
     }
 done
+caa_tool=
+if (( check_caa == 1 )); then
+    for command in dig host nslookup; do
+        if command -v "$command" >/dev/null 2>&1; then caa_tool=$command; break; fi
+    done
+fi
 
 # JSON is intentionally the only standard-output payload in this mode; all
 # progress and diagnostic output continues on standard error.
@@ -117,6 +141,15 @@ fi
 
 workdir=$(mktemp -d "${TMPDIR:-/tmp}/checkcrl.XXXXXX")
 trap 'rm -rf "$workdir"' EXIT
+
+add_warning() {
+    warnings+=("$1")
+    echo "Warning: $1" >&2
+}
+
+is_ldap_url() {
+    [[ "$1" =~ ^[Ll][Dd][Aa][Pp][Ss]?: ]]
+}
 
 fetch() {
     local url=$1 destination=$2
@@ -150,10 +183,13 @@ else
     connect_target="$connection_host:$port"
 fi
 
-echo "Fetching TLS certificate from ${domain}:${port} ..."
+starttls_args=()
+[[ -n "$starttls_proto" ]] && starttls_args=(-starttls "$starttls_proto")
+
+echo "Fetching TLS certificate from ${domain}:${port} ...${starttls_proto:+ (STARTTLS: $starttls_proto)}"
 if ! timeout "$connect_timeout" openssl s_client -connect "$connect_target" "${sni_args[@]}" \
-    -showcerts -status </dev/null >"$workdir/s_client.txt" 2>/dev/null; then
-    echo "Error: unable to connect or retrieve the certificate chain." >&2; exit 3
+    "${starttls_args[@]}" -showcerts -status </dev/null >"$workdir/s_client.txt" 2>/dev/null; then
+    echo "Error: unable to connect, negotiate STARTTLS, or retrieve the certificate chain." >&2; exit 3
 fi
 if ! awk -v output_dir="$workdir" '
         /-----BEGIN CERTIFICATE-----/ { number++; file=output_dir "/cert-" number ".pem"; writing=1 }
@@ -186,9 +222,72 @@ echo "Certificate information"
 openssl x509 -in "$leaf" -noout -subject -issuer -serial -dates -fingerprint -sha256
 openssl x509 -in "$leaf" -noout -ext subjectAltName 2>/dev/null || true
 
+echo
+echo "Connection security"
+negotiated_protocol=$(awk -F': ' '/^ *Protocol *:/{print $2; exit}' "$workdir/s_client.txt" | tr -d '\r ')
+negotiated_cipher=$(awk -F': ' '/^ *Cipher *:/{print $2; exit}' "$workdir/s_client.txt" | tr -d '\r ')
+[[ -n "$negotiated_protocol" ]] && echo "Negotiated protocol: $negotiated_protocol"
+[[ -n "$negotiated_cipher" ]] && echo "Negotiated cipher: $negotiated_cipher"
+case "$negotiated_protocol" in
+    SSLv2|SSLv3|TLSv1|TLSv1.1) add_warning "negotiated protocol $negotiated_protocol is deprecated/weak." ;;
+esac
+if [[ "$negotiated_cipher" =~ (^|_)(NULL|EXPORT|RC4|RC2|DES|MD5|anon)(_|$) ]]; then
+    add_warning "negotiated cipher $negotiated_cipher is weak."
+fi
+
+leaf_text=$(openssl x509 -in "$leaf" -noout -text 2>/dev/null)
+sig_alg=$(awk '/Signature Algorithm/{print $NF; exit}' <<<"$leaf_text")
+echo "Signature algorithm: $sig_alg"
+if [[ "$sig_alg" =~ [Mm][Dd]5 || "$sig_alg" =~ [Ss][Hh][Aa]1[^0-9] || "$sig_alg" =~ [Ss][Hh][Aa]1$ ]]; then
+    add_warning "certificate signature algorithm $sig_alg is weak (MD5/SHA-1)."
+fi
+
+pubkey_algo=$(awk '/Public Key Algorithm/{print $NF; exit}' <<<"$leaf_text")
+pubkey_bits=$(awk -F'[()]' '/Public-Key:/{print $2; exit}' <<<"$leaf_text" | awk '{print $1}')
+echo "Public key: ${pubkey_algo:-unknown} ${pubkey_bits:-?} bit"
+if [[ "$pubkey_algo" == *rsaEncryption* || "$pubkey_algo" == *dsaEncryption* ]] && [[ "$pubkey_bits" =~ ^[0-9]+$ ]] && (( pubkey_bits < 2048 )); then
+    add_warning "public key is only $pubkey_bits bits for $pubkey_algo (< 2048 is weak)."
+elif [[ "$pubkey_algo" == *ecPublicKey* || "$pubkey_algo" == *id-ecPublicKey* ]] && [[ "$pubkey_bits" =~ ^[0-9]+$ ]] && (( pubkey_bits < 224 )); then
+    add_warning "elliptic-curve public key is only $pubkey_bits bits (< 224 is weak)."
+fi
+
+echo
+echo "Key usage"
+key_usage_text=$(openssl x509 -in "$leaf" -noout -ext keyUsage,extendedKeyUsage 2>/dev/null)
+if [[ -n "$key_usage_text" ]]; then
+    printf '%s\n' "$key_usage_text"
+else
+    echo "  (no keyUsage/extendedKeyUsage extensions present)"
+fi
+if grep -qi 'Extended Key Usage' <<<"$key_usage_text" && ! grep -qi 'TLS Web Server Authentication' <<<"$key_usage_text"; then
+    add_warning "extendedKeyUsage is present but does not include TLS Web Server Authentication."
+fi
+
+echo
+echo "Certificate Transparency"
+if grep -qi 'CT Precertificate SCTs\|1\.3\.6\.1\.4\.1\.11129\.2\.4\.2' <<<"$leaf_text"; then
+    echo "SCT: embedded in certificate"
+elif grep -qi 'signed certificate timestamp' "$workdir/s_client.txt"; then
+    echo "SCT: present via TLS extension (unverified)"
+else
+    echo "SCT: none found"
+    add_warning "no Certificate Transparency SCT found (embedded or via TLS extension)."
+fi
+
 certificate_expired=0
+expiry_warning=0
+expiry_days_left=
 if openssl x509 -in "$leaf" -noout -checkend 0 >/dev/null 2>&1; then
-    echo "Certificate expiry: not expired"
+    end_date=$(openssl x509 -in "$leaf" -noout -enddate | sed 's/^notAfter=//')
+    end_epoch=$(date -u -d "$end_date" +%s 2>/dev/null || true)
+    if [[ -n "$end_epoch" ]]; then
+        expiry_days_left=$(( (end_epoch - $(date -u +%s)) / 86400 ))
+        if (( expiry_warn_days > 0 && expiry_days_left <= expiry_warn_days )); then
+            expiry_warning=1
+            add_warning "certificate expires in $expiry_days_left day(s) (within --expiry-warn-days $expiry_warn_days)."
+        fi
+    fi
+    echo "Certificate expiry: not expired${expiry_days_left:+ ($expiry_days_left day(s) remaining)}"
 else
     certificate_expired=1
     echo "Certificate validity: EXPIRED (or expires at the current time)" >&2
@@ -221,6 +320,7 @@ if [[ -z "$issuer_cert" ]]; then
     for index in "${!issuer_urls[@]}"; do
         issuer_download="$workdir/issuer-${index}.bin"
         issuer_candidate="$workdir/issuer-${index}.pem"
+        if is_ldap_url "${issuer_urls[$index]}"; then continue; fi
         if ! fetch "${issuer_urls[$index]}" "$issuer_download"; then continue; fi
         if openssl x509 -inform DER -in "$issuer_download" -out "$issuer_candidate" >/dev/null 2>&1; then :
         elif openssl x509 -inform PEM -in "$issuer_download" -out "$issuer_candidate" >/dev/null 2>&1; then :
@@ -256,6 +356,29 @@ if (( verify_peer == 1 )); then
     else
         peer_valid=1
         echo "Certificate trust: valid"
+    fi
+fi
+
+echo
+echo "CAA records"
+if (( is_ip == 1 )); then
+    echo "CAA status: skipped (connection target is an IP address, not a domain name)."
+elif (( check_caa == 0 )); then
+    echo "CAA status: skipped (--no-caa)."
+elif [[ -z "$caa_tool" ]]; then
+    echo "CAA status: skipped (no dig, host, or nslookup available)."
+else
+    caa_records=
+    case "$caa_tool" in
+        dig) caa_records=$(dig +short CAA "$connection_host" 2>/dev/null) ;;
+        host) caa_records=$(host -t CAA "$connection_host" 2>/dev/null | grep -i 'CAA' || true) ;;
+        nslookup) caa_records=$(nslookup -type=CAA "$connection_host" 2>/dev/null | grep -i 'CAA' || true) ;;
+    esac
+    if [[ -n "$caa_records" ]]; then
+        echo "CAA record(s) at $connection_host:"
+        printf '  %s\n' "$caa_records"
+    else
+        echo "CAA status: no CAA record found at $connection_host (parent domains not walked; any CA may issue)."
     fi
 fi
 
@@ -302,6 +425,7 @@ crl_has_serial() {
 for index in "${!crl_urls[@]}"; do
     url=${crl_urls[$index]}; downloaded="$workdir/crl-${index}.bin"; crl_pem="$workdir/crl-${index}.pem"
     echo; echo "Checking CRL: $url"
+    if is_ldap_url "$url"; then echo "  Result: LDAP CRL retrieval is not supported by this script" >&2; continue; fi
     if ! fetch "$url" "$downloaded"; then echo "  Result: unable to download CRL" >&2; continue; fi
     if openssl crl -inform DER -in "$downloaded" -out "$crl_pem" >/dev/null 2>&1; then :
     elif openssl crl -inform PEM -in "$downloaded" -out "$crl_pem" >/dev/null 2>&1; then :
@@ -361,7 +485,13 @@ fi
 
 echo
 if (( peer_valid == 1 )); then trust_status=TRUSTED; else trust_status=UNTRUSTED/INVALID; fi
-if (( certificate_expired == 1 )); then expiry_status=EXPIRED; else expiry_status='NOT EXPIRED'; fi
+if (( certificate_expired == 1 )); then
+    expiry_status=EXPIRED
+elif (( expiry_warning == 1 )); then
+    expiry_status='EXPIRING SOON'
+else
+    expiry_status='NOT EXPIRED'
+fi
 if (( revoked == 1 )); then
     revocation_status=REVOKED
 elif (( checked > 0 || ocsp_good > 0 )); then
@@ -467,14 +597,28 @@ print_ca_tree() {
 
 print_ca_tree
 echo
+echo "ADVISORY WARNINGS"
+if (( ${#warnings[@]} == 0 )); then
+    echo "  none"
+else
+    printf '  - %s\n' "${warnings[@]}"
+fi
+echo
+json_escape() {
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e ':a' -e 'N' -e '$!ba' -e 's/\n/\\n/g'
+}
 if [[ "$output_format" == json ]]; then
-    json_escape() {
-        printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e ':a' -e 'N' -e '$!ba' -e 's/\n/\\n/g'
-    }
-    printf '{"host":"%s","port":%s,"trust":"%s","revocation":"%s","expiry":"%s","stapled_ocsp":"%s","overall":"%s","exit_code":%s}\n' \
+    warnings_json='['
+    for index in "${!warnings[@]}"; do
+        (( index > 0 )) && warnings_json+=','
+        warnings_json+="\"$(json_escape "${warnings[$index]}")\""
+    done
+    warnings_json+=']'
+    printf '{"host":"%s","port":%s,"trust":"%s","revocation":"%s","expiry":"%s","expiry_days_left":%s,"stapled_ocsp":"%s","overall":"%s","exit_code":%s,"warnings":%s}\n' \
         "$(json_escape "$domain")" "$port" "$(json_escape "$trust_status")" \
         "$(json_escape "$revocation_status")" "$(json_escape "$expiry_status")" \
-        "$(json_escape "$stapled_ocsp")" "$(json_escape "$overall_status")" "$exit_code" >&3
+        "${expiry_days_left:-null}" \
+        "$(json_escape "$stapled_ocsp")" "$(json_escape "$overall_status")" "$exit_code" "$warnings_json" >&3
 else
     echo "FINAL STATUS"
     printf '  TRUST: %s\n' "$trust_status"
