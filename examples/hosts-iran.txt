@@ -13,15 +13,45 @@
 
 # Banking
 bankmellat.ir
+mellat.ir
+bpmellat.ir
 bmi.ir
 sb24.ir
 banksepah.ir
+sphbank.ir
 bsi.ir
 bank-maskan.ir
 tejaratbank.ir
 postbank.ir
 refah-bank.ir
 parsian-bank.ir
+bank-melli.ir
+baambank.ir
+sb24.com
+bpi.ir
+middleeastbank.ir
+bankino.digital
+blubank.com
+enbank.ir
+iparsian724.ir
+omidbank.ir
+bki.ir
+ttbank.ir
+edbi.ir
+bim.ir
+day24.ir
+bank-day.ir
+ebank.bank-day.ir
+sbank.ir
+sinabank.ir
+shahr-bank.ir
+red-bank.ir
+rqbank.ir
+vbank.rqb.ir
+tourismbank.ir
+ibank.tourism-bank.com
+vbank.tourismbank.ir
+
 
 # Marketplace / ride-hailing / e-commerce
 divar.ir
@@ -41,6 +71,9 @@ exir.io
 ramzinex.com
 tabdeal.org
 excoino.com
+ok-ex.io
+tetherland.com
+arzdigital.com
 
 # Cloud providers
 arvancloud.ir
@@ -52,6 +85,21 @@ president.ir
 mfa.ir
 cbi.ir
 majlis.ir
+irica.ir
+irica.gov.ir
+ntsw.ir
+sso.my.gov.ir
+iran.gov.ir
+tax.gov.ir
+intamedia.ir
+adliran.ir
+eadl.ir
+behdasht.gov.ir
+medu.ir
+iribonline.ir
+tamin.ir
+sejam.ir
+csdiran.ir
 
 # Media / news
 aparat.com
@@ -60,6 +108,20 @@ irna.ir
 farsnews.ir
 mehrnews.com
 yjc.ir
+asriran.com
+
+#Messenger
+ble.ir
+web.bale.ai
+eitaa.com
+rubika.ir
+shad.ir
+my.shad.ir
+web.gap.im
+web.splus.ir
+soroushplus.com
+
+
 
 # Baseline (non-Iranian, for comparison)
 google.com
