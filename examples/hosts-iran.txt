@@ -37,6 +37,7 @@ enbank.ir
 iparsian724.ir
 omidbank.ir
 bki.ir
+bank-keshavarzi.com
 ttbank.ir
 edbi.ir
 bim.ir
@@ -117,7 +118,6 @@ eitaa.com
 rubika.ir
 shad.ir
 my.shad.ir
-web.gap.im
 web.splus.ir
 soroushplus.com
 
