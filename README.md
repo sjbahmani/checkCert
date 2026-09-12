@@ -178,11 +178,15 @@ Use `--connect-timeout`, `--request-timeout`, `--max-ocsp-age`, and
 to CRL and OCSP HTTP requests; direct TLS certificate retrieval is not routed
 through an HTTP proxy.
 
-If the initial TLS connection fails (transient network blips, filtering,
-etc.), it's retried automatically — `--connect-retries` sets how many extra
-attempts to make (default 4; `0` disables retrying) and `--retry-delay` sets
+If a network operation fails (transient blips, filtering, etc.) — the
+initial TLS connection, a CRL download, or an OCSP query — it's retried
+automatically. `--connect-retries` sets how many extra attempts to make for
+each of these (default 4; `0` disables retrying) and `--retry-delay` sets
 the pause between attempts in seconds (default 3). This applies per host, so
-in `--hosts-file` batch mode each host gets its own retries.
+in `--hosts-file` batch mode each host gets its own retries. Without this, a
+single transient CRL/OCSP failure for a certificate that has no other usable
+revocation source would surface as `REVOCATION: UNKNOWN` even though the
+certificate itself is fine.
 
 ## Exit codes
 

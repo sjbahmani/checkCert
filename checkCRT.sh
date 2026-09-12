@@ -44,8 +44,9 @@ Options:
                       (one object per host, newline-delimited in batch mode).
   --connect-timeout N TLS connection timeout in seconds (default: 5).
   --request-timeout N CRL/OCSP request timeout in seconds (default: 20).
-  --connect-retries N Retry the initial TLS connection up to N extra times
-                      on failure (default: 4; 0 disables retrying).
+  --connect-retries N Retry a failed network operation (initial TLS
+                      connection, CRL download, or OCSP query) up to N
+                      extra times (default: 4; 0 disables retrying).
   --retry-delay N     Seconds to wait between connection retries (default: 3).
   --max-ocsp-age N    Maximum OCSP response age in seconds (default: 86400).
   --clock-skew N      Allowed clock skew for OCSP in seconds (default: 300).
@@ -261,19 +262,26 @@ emit_error_json() {
 
 fetch() {
     local url=$1 destination=$2
-    if command -v curl >/dev/null 2>&1; then
-        curl_args=(--fail --location --silent --show-error --connect-timeout "$connect_timeout" --max-time "$request_timeout")
-        [[ -n "$proxy" ]] && curl_args+=(--proxy "$proxy")
-        [[ -n "$no_proxy" ]] && curl_args+=(--noproxy "$no_proxy")
-        curl "${curl_args[@]}" --output "$destination" "$url"
-    elif command -v wget >/dev/null 2>&1; then
-        wget_args=(--quiet --timeout="$connect_timeout" --tries=2 --output-document="$destination")
-        [[ -n "$proxy" ]] && wget_args+=(-e use_proxy=yes -e "http_proxy=$proxy" -e "https_proxy=$proxy")
-        [[ -n "$no_proxy" ]] && wget_args+=(-e "no_proxy=$no_proxy")
-        wget "${wget_args[@]}" "$url"
-    else
-        echo "Error: curl or wget is required to download CRLs." >&2; return 1
-    fi
+    local fetch_attempt=0
+    while :; do
+        if command -v curl >/dev/null 2>&1; then
+            curl_args=(--fail --location --silent --show-error --connect-timeout "$connect_timeout" --max-time "$request_timeout")
+            [[ -n "$proxy" ]] && curl_args+=(--proxy "$proxy")
+            [[ -n "$no_proxy" ]] && curl_args+=(--noproxy "$no_proxy")
+            curl "${curl_args[@]}" --output "$destination" "$url" && return 0
+        elif command -v wget >/dev/null 2>&1; then
+            wget_args=(--quiet --timeout="$connect_timeout" --tries=2 --output-document="$destination")
+            [[ -n "$proxy" ]] && wget_args+=(-e use_proxy=yes -e "http_proxy=$proxy" -e "https_proxy=$proxy")
+            [[ -n "$no_proxy" ]] && wget_args+=(-e "no_proxy=$no_proxy")
+            wget "${wget_args[@]}" "$url" && return 0
+        else
+            echo "Error: curl or wget is required to download CRLs." >&2
+            return 1
+        fi
+        (( fetch_attempt >= connect_retries )) && return 1
+        fetch_attempt=$((fetch_attempt + 1))
+        (( retry_delay > 0 )) && sleep "$retry_delay"
+    done
 }
 
 crl_is_current() {
@@ -317,7 +325,7 @@ check_certificate_revocation() {
     local cert=$1 label=$2 verifier=$3
     local cert_serial local_crl_urls idx url downloaded crl_pem
     local checked_local=0 revoked_local=0 ocsp_good_local=0
-    local ocsp_url_local ocsp_output ocsp_rc ocsp_proxy_args
+    local ocsp_url_local ocsp_output ocsp_rc ocsp_proxy_args ocsp_attempt
 
     cert_serial=$(openssl x509 -in "$cert" -noout -serial | sed 's/^serial=//' | tr -d ':' | tr '[:lower:]' '[:upper:]')
     mapfile -t local_crl_urls < <(
@@ -370,10 +378,17 @@ check_certificate_revocation() {
             ocsp_proxy_args=()
             [[ -n "$proxy" ]] && ocsp_proxy_args+=(-proxy "$proxy")
             [[ -n "$no_proxy" ]] && ocsp_proxy_args+=(-no_proxy "$no_proxy")
-            ocsp_output=$(timeout "$request_timeout" openssl ocsp -issuer "$verifier" -cert "$cert" -url "$ocsp_url_local" \
-                -no_nonce -CAfile "$verifier" -partial_chain -validity_period "$clock_skew" \
-                -status_age "$max_ocsp_age" "${ocsp_proxy_args[@]}" 2>&1)
-            ocsp_rc=$?
+            ocsp_attempt=0
+            while :; do
+                ocsp_output=$(timeout "$request_timeout" openssl ocsp -issuer "$verifier" -cert "$cert" -url "$ocsp_url_local" \
+                    -no_nonce -CAfile "$verifier" -partial_chain -validity_period "$clock_skew" \
+                    -status_age "$max_ocsp_age" "${ocsp_proxy_args[@]}" 2>&1)
+                ocsp_rc=$?
+                (( ocsp_rc == 0 )) && break
+                (( ocsp_attempt >= connect_retries )) && break
+                ocsp_attempt=$((ocsp_attempt + 1))
+                (( retry_delay > 0 )) && sleep "$retry_delay"
+            done
             if (( ocsp_rc != 0 )); then
                 echo "  Result: OCSP query or response verification failed" >&2
                 printf '%s\n' "$ocsp_output" | sed 's/^/    /' >&2
