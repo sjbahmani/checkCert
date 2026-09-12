@@ -255,8 +255,8 @@ emit_error_json() {
     batch_issuer=
     batch_days_left=
     [[ "$output_format" == json ]] || return 0
-    printf '{"host":"%s","port":%s,"issuer":null,"trust":null,"revocation":null,"expiry":null,"expiry_days_left":null,"intermediate_revoked":null,"stapled_ocsp":null,"overall":"ERROR","exit_code":3,"warnings":[],"error":"%s"}\n' \
-        "$(json_escape "$err_domain")" "$err_port" "$(json_escape "$message")" >&3
+    printf '{"host":"%s","port":%s,"issuer":null,"trust":null,"revocation":null,"expiry":null,"expiry_days_left":null,"intermediate_revoked":null,"stapled_ocsp":null,"overall":"ERROR","reason":"%s","exit_code":3,"warnings":[],"error":"%s"}\n' \
+        "$(json_escape "$err_domain")" "$err_port" "$(json_escape "$message")" "$(json_escape "$message")" >&3
 }
 
 fetch() {
@@ -419,8 +419,9 @@ check_host() {
     local -a issuer_urls=()
     local index issuer_download issuer_candidate
     local chain_bundle
-    local -a verify_args=()
+    local -a verify_args=() chain_only_args=()
     local peer_valid=0
+    local peer_trust_detail peer_verify_output peer_verify_rc certificate_names openssl_reason
     local -a chain_list=()
     local -A revocation_flag=()
     local intermediate_revoked=0
@@ -748,9 +749,40 @@ check_host() {
         [[ -n "$ca_path" ]] && verify_args+=(-CApath "$ca_path")
         echo
         echo "Verifying certificate chain and identity ..."
-        if ! openssl verify "${verify_args[@]}" "$leaf"; then
+        peer_verify_output=$(openssl verify "${verify_args[@]}" "$leaf" 2>&1)
+        peer_verify_rc=$?
+        printf '%s\n' "$peer_verify_output"
+        if (( peer_verify_rc != 0 )); then
             peer_valid=0
-            echo "Certificate trust: INVALID (chain or hostname/IP verification failed)." >&2
+            if grep -qi 'hostname mismatch\|ip address mismatch' <<<"$peer_verify_output"; then
+                # The chain signature/trust checks passed; only the identity
+                # check failed. Re-run without -verify_hostname/-verify_ip to
+                # say precisely that, instead of the vague combined message,
+                # and report which name(s) the certificate actually covers.
+                certificate_names=$(openssl x509 -in "$leaf" -noout -ext subjectAltName 2>/dev/null \
+                    | grep -oE 'DNS:[^, ]+|IP Address:[^, ]+' | sed -E 's/^(DNS|IP Address)://' | paste -sd, -)
+                [[ -z "$certificate_names" ]] && certificate_names=$(certificate_subject "$leaf" | grep -oE 'CN=[^,]+' | sed 's/^CN=//')
+                chain_only_args=(-purpose sslserver)
+                [[ -s "$chain_bundle" ]] && chain_only_args+=(-untrusted "$chain_bundle")
+                [[ -n "$ca_file" ]] && chain_only_args+=(-CAfile "$ca_file")
+                [[ -n "$ca_path" ]] && chain_only_args+=(-CApath "$ca_path")
+                if openssl verify "${chain_only_args[@]}" "$leaf" >/dev/null 2>&1; then
+                    peer_trust_detail="certificate chain is trusted, but does not cover the requested name '$connection_host' (certificate covers: ${certificate_names:-none found})"
+                else
+                    peer_trust_detail="requested name '$connection_host' is not covered by the certificate (covers: ${certificate_names:-none found}), and the certificate chain is also not trusted"
+                fi
+            else
+                # Not an identity problem: surface OpenSSL's own reason
+                # instead of a vague default.
+                openssl_reason=$(grep -oE 'depth lookup: .*' <<<"$peer_verify_output" | sed 's/^depth lookup: //' | tail -1)
+                if [[ -n "$openssl_reason" ]]; then
+                    peer_trust_detail="certificate chain is not trusted: $openssl_reason"
+                else
+                    peer_trust_detail="certificate chain or hostname/IP verification failed"
+                fi
+            fi
+            echo "Certificate trust: INVALID ($peer_trust_detail)." >&2
+            add_warning "$peer_trust_detail."
         else
             peer_valid=1
             echo "Certificate trust: valid"
@@ -857,7 +889,7 @@ check_host() {
     elif (( peer_valid != 1 )); then
         overall_status=UNTRUSTED/INVALID
         exit_code=5
-        reason="certificate chain or hostname/IP verification failed"
+        reason=${peer_trust_detail:-"certificate chain or hostname/IP verification failed"}
     elif [[ "$revocation_status" == 'NOT REVOKED' ]]; then
         if (( fail_on_expiry_warning == 1 && expiry_warning == 1 )); then
             overall_status='VALID (EXPIRING SOON)'
@@ -993,12 +1025,12 @@ check_host() {
             warnings_json+="\"$(json_escape "${warnings[$index]}")\""
         done
         warnings_json+=']'
-        printf '{"host":"%s","port":%s,"issuer":"%s","trust":"%s","revocation":"%s","expiry":"%s","expiry_days_left":%s,"intermediate_revoked":%s,"stapled_ocsp":"%s","overall":"%s","exit_code":%s,"warnings":%s}\n' \
+        printf '{"host":"%s","port":%s,"issuer":"%s","trust":"%s","revocation":"%s","expiry":"%s","expiry_days_left":%s,"intermediate_revoked":%s,"stapled_ocsp":"%s","overall":"%s","reason":"%s","exit_code":%s,"warnings":%s}\n' \
             "$(json_escape "$domain")" "$port" "$(json_escape "$issuer_cn")" "$(json_escape "$trust_status")" \
             "$(json_escape "$revocation_status")" "$(json_escape "$expiry_status")" \
             "${expiry_days_left:-null}" \
             "$(if (( intermediate_revoked == 1 )); then echo true; else echo false; fi)" \
-            "$(json_escape "$stapled_ocsp")" "$(json_escape "$overall_status")" "$exit_code" "$warnings_json" >&3
+            "$(json_escape "$stapled_ocsp")" "$(json_escape "$overall_status")" "$(json_escape "$reason")" "$exit_code" "$warnings_json" >&3
     else
         echo "FINAL STATUS"
         printf '  ISSUER: %s\n' "${issuer_cn:-unknown}"
@@ -1007,6 +1039,7 @@ check_host() {
         printf '  EXPIRY: %s\n' "$expiry_status"
         printf '  DAYS REMAINING: %s\n' "${expiry_days_left:-N/A}"
         printf '  OVERALL: %s\n' "$overall_status"
+        printf '  REASON: %s\n' "$reason"
     fi
     return "$exit_code"
 }
