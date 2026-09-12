@@ -110,6 +110,8 @@ farsnews.ir
 mehrnews.com
 yjc.ir
 asriran.com
+telewebion.ir
+telewebion.net
 
 #Messenger
 ble.ir
