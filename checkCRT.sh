@@ -1168,11 +1168,14 @@ if [[ -n "$hosts_file" ]]; then
             fi
         done
 
-        # Column widths: HOST/STATUS/ISSUER/DAYS LEFT size to their widest
-        # value (ISSUER capped, longer values are shown truncated with an
-        # ellipsis); REASON is last and left unpadded so it isn't cut off.
+        # Column widths: HOST/STATUS/ISSUER/DAYS LEFT/REASON size to their
+        # widest value, but ISSUER and REASON are capped (longer values are
+        # shown truncated with an ellipsis) so one long entry can't blow up
+        # the whole table or wrap the terminal line; run the single host (or
+        # use --json) for the untruncated reason.
         batch_issuer_cap=42
-        declare -a batch_issuer_disp=()
+        batch_reason_cap=60
+        declare -a batch_issuer_disp=() batch_reason_disp=()
         batch_host_w=4
         batch_status_w=6
         batch_issuer_w=6
@@ -1187,6 +1190,10 @@ if [[ -n "$hosts_file" ]]; then
             fi
             batch_issuer_disp[batch_i]=$batch_disp
             (( ${#batch_disp} > batch_issuer_w )) && batch_issuer_w=${#batch_disp}
+            batch_reason_disp[batch_i]=${batch_row_reason[$batch_i]}
+            if (( ${#batch_reason_disp[$batch_i]} > batch_reason_cap )); then
+                batch_reason_disp[batch_i]="${batch_row_reason[$batch_i]:0:$((batch_reason_cap - 1))}…"
+            fi
         done
 
         echo
@@ -1206,7 +1213,7 @@ if [[ -n "$hosts_file" ]]; then
                 "$batch_host_w" "${batch_row_host[$batch_i]}" \
                 "$batch_issuer_w" "${batch_issuer_disp[$batch_i]}" \
                 "$batch_days_w" "${batch_row_days_left[$batch_i]}" \
-                "${batch_row_reason[$batch_i]}"
+                "${batch_reason_disp[$batch_i]}"
         done
     fi
     exit "$batch_worst"
