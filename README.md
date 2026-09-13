@@ -279,7 +279,10 @@ the exit code, since browsers and CAs vary in how strictly they enforce them.
 ## Revocation checks
 
 CRLs must have a valid signature and a current `lastUpdate`/`nextUpdate`
-period. OCSP responses are signature-verified, tolerate only the configured
+period. Both downloaded and cached CRLs require explicit `verify OK` plus a
+successful OpenSSL exit code: OpenSSL 3.0 may return success even when it
+reports a signature failure. This check also supports OpenSSL 3.5.
+OCSP responses are signature-verified, tolerate only the configured
 clock skew, and are rejected when older than `--max-ocsp-age` (24 hours by
 default). `STAPLED OCSP` reports the status sent during the TLS handshake; it
 is marked `UNVERIFIED` because OpenSSL's `s_client` text output does not expose

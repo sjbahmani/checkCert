@@ -22,4 +22,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq busybox-static
       - name: Run functional tests (local PKI, no network required)
-        run: ./tests/functional/run.sh
+        run: |
+          openssl version -a
+          ./tests/functional/run.sh

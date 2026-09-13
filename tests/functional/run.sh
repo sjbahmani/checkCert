@@ -525,6 +525,32 @@ invalid_entries=("$PKI_DIR/invalid-cache"/*.pem)
 assert_output "bad signature leaves no cache entry" test ! -e "${invalid_entries[0]}"
 cp "$PKI_DIR/original.crl" "$PKI_DIR/www/intermediate.crl"
 
+# Exercise 3.0's exit-zero signature failure even when running on OpenSSL 3.5.
+# The shim changes only the exit code, never the cryptographic verification.
+export CHECKCRT_TEST_OPENSSL_BIN
+CHECKCRT_TEST_OPENSSL_BIN=$(command -v openssl)
+export CHECKCRT_TEST_LEGACY_LOG="$PKI_DIR/legacy-crl.log"
+mkdir "$PKI_DIR/legacy-bin"
+cp "$script_dir/crl_verify_wrapper.sh" "$PKI_DIR/legacy-bin/openssl"
+chmod +x "$PKI_DIR/legacy-bin/openssl"
+legacy_path="$PKI_DIR/legacy-bin:$PATH"
+seed_cache "$cached_crl" "$PKI_DIR/badsig.crl"
+: > "$CHECKCRT_TEST_FETCH_LOG"
+check_exit "legacy exit-zero bad cached signature triggers refresh" 0 \
+    env PATH="$legacy_path" "$check" "${cache_args[@]}" --cache-dir "$persistent_cache" 127.0.0.1 "$GOOD_PORT"
+assert_output "legacy bad cached signature needs a real download" fetch_count_is 1
+cp "$PKI_DIR/badsig.crl" "$PKI_DIR/www/intermediate.crl"
+check_exit "legacy exit-zero bad downloaded signature remains UNKNOWN" 3 \
+    env PATH="$legacy_path" "$check" "${cache_args[@]}" --cache-dir "$PKI_DIR/legacy-cache" --json 127.0.0.1 "$GOOD_PORT"
+assert_output "legacy bad signature cannot become positive JSON evidence" \
+    json_matches 'length == 1 and (.[0] | .revocation == "UNKNOWN" and .exit_code == 3)' /tmp/functest.out
+legacy_entries=("$PKI_DIR/legacy-cache"/*.pem)
+assert_output "legacy bad signature is never cached" test ! -e "${legacy_entries[0]}"
+check_exit "legacy exit-zero bad signature rejected with --no-cache" 3 \
+    env PATH="$legacy_path" "$check" "${cache_args[@]}" --no-cache 127.0.0.1 "$GOOD_PORT"
+assert_output "test exercised actual signature failure with exit zero" test -s "$CHECKCRT_TEST_LEGACY_LOG"
+cp "$PKI_DIR/original.crl" "$PKI_DIR/www/intermediate.crl"
+
 # Both supported HTTP encodings must be normalized before cache publication.
 openssl crl -in "$PKI_DIR/original.crl" -outform DER -out "$PKI_DIR/www/intermediate.crl"
 openssl x509 -in "$PKI_DIR/certs/intermediate.pem" -outform DER -out "$PKI_DIR/www/intermediate.crt"

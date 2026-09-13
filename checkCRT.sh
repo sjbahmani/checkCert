@@ -9,7 +9,7 @@
 
 set -u -o pipefail
 
-VERSION=1.14.0
+VERSION=1.14.1
 verify_peer=1
 ca_file=
 ca_path=
@@ -421,6 +421,15 @@ fetch() {
     done
 }
 
+crl_signature_is_valid() {
+    local crl=$1 verifier=$2 verification
+    [[ -n "$verifier" ]] || return 1
+    # OpenSSL 3.0 can print "verify failure" yet exit 0. Require positive
+    # signature evidence as well as success, for fresh and cached CRLs alike.
+    verification=$(LC_ALL=C openssl crl -in "$crl" -noout -verify -CAfile "$verifier" 2>&1) || return 1
+    [[ "$verification" == 'verify OK' ]]
+}
+
 crl_is_current() {
     local crl=$1 last_update next_update last_epoch next_epoch now
     last_update=$(openssl crl -in "$crl" -noout -lastupdate | sed 's/^lastUpdate=//')
@@ -444,7 +453,7 @@ cache_object_is_valid() {
         grep -Fxq -- "$cert: good" "$report" || grep -Fxq -- "$cert: revoked" "$report"
     else
         [[ -n "$verifier" ]] || return 1
-        openssl crl -in "$object" -noout -verify -CAfile "$verifier" >/dev/null 2>&1 || return 1
+        crl_signature_is_valid "$object" "$verifier" || return 1
         crl_is_current "$object" 2>/dev/null || return 1
         # Do not use clock-skew tolerance to extend the cache's lifetime.
         next_update=$(openssl crl -in "$object" -noout -nextupdate 2>/dev/null | sed 's/^nextUpdate=//')
@@ -658,7 +667,7 @@ check_certificate_revocation() {
         if is_ldap_url "$url"; then echo "  Result: LDAP CRL retrieval is not supported by this script" >&2; continue; fi
         if ! fetch_cached_object crl "$url" "$crl_pem" "$verifier"; then echo "  Result: unable to retrieve a usable CRL" >&2; continue; fi
         openssl crl -in "$crl_pem" -noout -issuer -lastupdate -nextupdate
-        if [[ -z "$verifier" ]] || ! openssl crl -in "$crl_pem" -noout -verify -CAfile "$verifier" >/dev/null 2>&1; then
+        if ! crl_signature_is_valid "$crl_pem" "$verifier"; then
             echo "  Result: CRL signature could not be verified" >&2; continue
         fi
         if ! crl_is_current "$crl_pem"; then

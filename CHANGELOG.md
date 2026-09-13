@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.14.1
+
+- Reject invalid CRL signatures on OpenSSL 3.0 as well as 3.5. Require
+  explicit verification success instead of relying only on the exit code,
+  which older OpenSSL can report as zero even for a bad signature.
+- Apply the same check to cached and freshly downloaded CRLs, including
+  `--no-cache`, and add regressions for the legacy exit-zero behavior using
+  real signed/corrupted CRLs. No new dependencies are required.
+
 ## 1.14.0
 
 - Cache verified OCSP responses alongside CRL/AIA data using the existing
