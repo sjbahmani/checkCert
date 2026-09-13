@@ -56,6 +56,7 @@ Options:
                       hostname for SNI and identity checks. Applies to all hosts.
   --cache-dir DIR     Keep verified CRL/AIA/OCSP data between runs in a private
                       directory. By default, the cache lasts only this run.
+                      Shared downloads wait for a per-object lock (uses flock).
   --cache-max-age N   Maximum cached download age in seconds (default: 14400;
                       4 hours).
                       CRL/OCSP entries are never reused past nextUpdate.
@@ -297,6 +298,10 @@ for command in openssl awk sed grep mktemp timeout tr sort date tail; do
         echo "Error: '$command' is required." >&2; exit 3;
     }
 done
+if (( cache_enabled == 1 )) && ! command -v flock >/dev/null 2>&1; then
+    echo "Error: 'flock' (util-linux) is required for caching; install it or use --no-cache." >&2
+    exit 3
+fi
 caa_tool=
 if (( check_caa == 1 )); then
     for command in dig host nslookup; do
@@ -459,10 +464,19 @@ crl_is_current() {
     (( next_epoch > last_epoch && last_epoch <= now + clock_skew && next_epoch > now - clock_skew ))
 }
 
+crl_cache_lifetime_is_valid() {
+    local crl=$1 next_update next_epoch
+    crl_is_current "$crl" 2>/dev/null || return 1
+    # Do not use clock-skew tolerance to extend the cache's lifetime.
+    next_update=$(openssl crl -in "$crl" -noout -nextupdate 2>/dev/null | sed 's/^nextUpdate=//')
+    next_epoch=$(date -u -d "$next_update" +%s 2>/dev/null) || return 1
+    (( next_epoch > $(date -u +%s) ))
+}
+
 # Cache entries are evidence, never trust anchors or cached verdicts. Validate
 # each object against this host's actual issuer/leaf, even on a cache hit.
 cache_object_is_valid() {
-    local kind=$1 object=$2 verifier=$3 cert=${4:-} report=${5:-} next_update next_epoch
+    local kind=$1 object=$2 verifier=$3 cert=${4:-} report=${5:-}
     if [[ "$kind" == aia ]]; then
         is_issuer_of_leaf "$object"
     elif [[ "$kind" == ocsp ]]; then
@@ -472,11 +486,7 @@ cache_object_is_valid() {
     else
         [[ -n "$verifier" ]] || return 1
         crl_signature_is_valid "$object" "$verifier" || return 1
-        crl_is_current "$object" 2>/dev/null || return 1
-        # Do not use clock-skew tolerance to extend the cache's lifetime.
-        next_update=$(openssl crl -in "$object" -noout -nextupdate 2>/dev/null | sed 's/^nextUpdate=//')
-        next_epoch=$(date -u -d "$next_update" +%s 2>/dev/null) || return 1
-        (( next_epoch > $(date -u +%s) ))
+        crl_cache_lifetime_is_valid "$object"
     fi
 }
 
@@ -503,17 +513,18 @@ cache_read() {
 }
 
 # Normalize CRL/AIA downloads to PEM and retain signed OCSP responses as DER.
-# A short, per-request mkdir lock coalesces
-# parallel downloads without flock or a persistent lock daemon. An abandoned
-# lock costs at most five seconds, then we fetch without caching; it cannot
-# make us accept old evidence. Subshell-scoped cleanup never affects a host's
-# or the parent process's EXIT trap.
+# A blocking per-object flock coalesces parallel downloads, including across
+# runs sharing a cache directory. Never unlink lock files: waiters must keep
+# using the same inode. The kernel releases the lock when its last descriptor
+# closes, including after a crash. Subshell cleanup leaves parent traps alone.
+# For CRLs, success guarantees the destination's signature was verified
+# against this call's issuer, including when caching is disabled. Callers
+# still check freshness at use time and look up each certificate's serial.
 fetch_cached_object() (
     local kind=$1 url=$2 destination=$3 verifier=${4:-} cert=${5:-} report=${6:-}
-    local key entry='' lock_dir='' lock_held=0 cache_temp=''
-    local lock_deadline=$((SECONDS + 5))
-    local decoder fetched_at cert_fp issuer_fp
-    trap '[[ -z "$cache_temp" ]] || rm -f -- "$cache_temp"; if (( lock_held == 1 )); then rmdir -- "$lock_dir" 2>/dev/null || true; fi' EXIT
+    local key entry='' lock_file='' lock_fd lock_rc lock_held=0 cache_temp=''
+    local decoder fetched_at cert_fp issuer_fp cacheable=0
+    trap '[[ -z "$cache_temp" ]] || rm -f -- "$cache_temp"' EXIT
     if (( cache_enabled == 1 )); then
         if [[ "$kind" == ocsp ]]; then
             # A responder serves many certificates. Never reuse a response
@@ -528,31 +539,39 @@ fetch_cached_object() (
         if [[ "$key" =~ ^[[:xdigit:]]{64}$ ]]; then
             entry="$cache_dir/v1-$kind-$key.pem"
             [[ "$kind" == ocsp ]] && entry="$cache_dir/v1-ocsp-$key.ocsp"
-            lock_dir="$entry.lock"
+            lock_file="$entry.lock"
             if cache_read "$kind" "$entry" "$destination" "$verifier" "$cert" "$report"; then exit 0; fi
-            if (umask 077; mkdir -- "$lock_dir") 2>/dev/null; then
-                lock_held=1
-                # Another worker may have published after our first read.
-                if cache_read "$kind" "$entry" "$destination" "$verifier" "$cert" "$report"; then exit 0; fi
-            else
-                # The owner publishes before releasing its lock. Poll only
-                # the lock, not an unchanged, unusable entry: revalidating it
-                # on every tick repeats copying and OpenSSL work per waiter.
-                while [[ -d "$lock_dir" && ! -L "$lock_dir" && -w "$cache_dir" ]] \
-                    && (( SECONDS < lock_deadline )); do
-                    sleep 0.1
-                done
-                if cache_read "$kind" "$entry" "$destination" "$verifier" "$cert" "$report"; then exit 0; fi
-                # If the owner failed to publish usable evidence, do not take
-                # turns retrying under the same lock. Waiters fetch in parallel
-                # without caching; all normal caller validation still applies.
-                echo "  Cache BYPASS (${kind^^}): NOT USED; cache unavailable/busy or shared download unusable, downloading without caching." >&2
+            # This subshell's umask keeps newly-created lock files private.
+            # Refuse legacy mkdir locks and unsafe paths instead of allowing
+            # an uncoordinated download. Opening with >> never truncates.
+            umask 077
+            if [[ -L "$lock_file" ]] || { [[ -e "$lock_file" ]] && [[ ! -f "$lock_file" || ! -O "$lock_file" ]]; } \
+                || ! { exec {lock_fd}>>"$lock_file"; } 2>/dev/null; then
+                echo "  Cache ERROR (${kind^^}): cannot open cache lock; no uncoordinated download attempted." >&2
+                exit 1
             fi
-            if (( lock_held == 1 )); then
-                printf '  Cache MISS (%s): NOT USED; no fresh verified entry, downloading\n' "${kind^^}"
-            fi
+            while :; do
+                # Five seconds is a recheck interval, never permission to
+                # download around an owner. flock wakes early on release.
+                if flock -x -w 5 -E 200 "$lock_fd"; then
+                    break
+                else
+                    lock_rc=$?
+                fi
+                if (( lock_rc != 200 )); then
+                    echo "  Cache ERROR (${kind^^}): cannot acquire cache lock; no uncoordinated download attempted." >&2
+                    exit 1
+                fi
+                printf '  Cache WAIT (%s): shared download still in progress; waiting again\n' "${kind^^}"
+            done
+            lock_held=1
+            # The previous owner may have published while we were waiting.
+            # Every host verifies the result against its own certificate.
+            if cache_read "$kind" "$entry" "$destination" "$verifier" "$cert" "$report"; then exit 0; fi
+            printf '  Cache MISS (%s): NOT USED; no fresh verified entry, downloading\n' "${kind^^}"
         else
-            echo "  Cache BYPASS (${kind^^}): NOT USED; unable to compute cache key, downloading without caching." >&2
+            echo "  Cache ERROR (${kind^^}): unable to compute cache key; no uncoordinated download attempted." >&2
+            exit 1
         fi
     else
         printf '  Cache BYPASS (%s): NOT USED; disabled by --no-cache, downloading\n' "${kind^^}"
@@ -571,7 +590,19 @@ fetch_cached_object() (
             exit 1
         fi
     fi
-    if (( lock_held == 1 )) && cache_object_is_valid "$kind" "$destination" "$verifier" "$cert" "$report"; then
+    if [[ "$kind" == crl ]]; then
+        # Verify fresh CRLs once regardless of caching. Cache publication
+        # reuses this check for the same private file and issuer; it only
+        # needs to enforce the stricter cache lifetime separately.
+        if ! crl_signature_is_valid "$destination" "$verifier"; then
+            echo "  Result: CRL signature could not be verified" >&2
+            exit 1
+        fi
+        if (( lock_held == 1 )) && crl_cache_lifetime_is_valid "$destination"; then cacheable=1; fi
+    elif (( lock_held == 1 )) && cache_object_is_valid "$kind" "$destination" "$verifier" "$cert" "$report"; then
+        cacheable=1
+    fi
+    if (( cacheable == 1 )); then
         if cache_temp=$(mktemp "$cache_dir/.checkcrt-cache.XXXXXX") \
             && { printf '# checkCRT-cache-v1 %s\n' "$fetched_at";
                  if [[ "$kind" == ocsp ]]; then openssl base64 -in "$destination"; else cat "$destination"; fi; } > "$cache_temp" \
@@ -581,8 +612,8 @@ fetch_cached_object() (
             echo "  Warning: unable to save ${kind^^} cache entry; using the downloaded object." >&2
         fi
     fi
-    # The caller still checks signature, validity and trust. In particular,
-    # an invalid newly-downloaded object is never written to the cache.
+    # The caller still checks current validity, trust, and per-certificate
+    # revocation. Invalid newly-downloaded objects never enter the cache.
     exit 0
 )
 
@@ -687,9 +718,8 @@ check_certificate_revocation() {
         if is_ldap_url "$url"; then echo "  Result: LDAP CRL retrieval is not supported by this script" >&2; continue; fi
         if ! fetch_cached_object crl "$url" "$crl_pem" "$verifier"; then echo "  Result: unable to retrieve a usable CRL" >&2; continue; fi
         openssl crl -in "$crl_pem" -noout -issuer -lastupdate -nextupdate
-        if ! crl_signature_is_valid "$crl_pem" "$verifier"; then
-            echo "  Result: CRL signature could not be verified" >&2; continue
-        fi
+        # fetch_cached_object verified this private snapshot's signature
+        # against this issuer. Recheck time, which can advance after fetching.
         if ! crl_is_current "$crl_pem"; then
             echo "  Result: CRL is stale, not yet valid, or has no usable update period" >&2; continue
         fi

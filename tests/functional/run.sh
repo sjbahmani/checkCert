@@ -586,6 +586,42 @@ check_exit "legacy exit-zero bad signature rejected with --no-cache" 3 \
 assert_output "test exercised actual signature failure with exit zero" test -s "$CHECKCRT_TEST_LEGACY_LOG"
 cp "$PKI_DIR/original.crl" "$PKI_DIR/www/intermediate.crl"
 
+# Count real cryptographic checks: the caller must not repeat a successful
+# fetch's CRL signature verification, and each host must still verify its own.
+signature_log="$PKI_DIR/crl-signature-count.log"
+for signature_mode in cold warm disabled; do
+    signature_args=(--cache-dir "$PKI_DIR/signature-cache")
+    signature_fetches=0
+    if [[ "$signature_mode" == cold ]]; then signature_fetches=1; fi
+    if [[ "$signature_mode" == disabled ]]; then
+        signature_args+=(--no-cache)
+        signature_fetches=1
+    fi
+    : > "$signature_log"
+    : > "$CHECKCRT_TEST_FETCH_LOG"
+    check_exit "CRL signature checked once with $signature_mode cache" 0 \
+        env PATH="$legacy_path" CHECKCRT_TEST_CRL_VERIFY_LOG="$signature_log" \
+        "$check" "${cache_args[@]}" "${signature_args[@]}" --json 127.0.0.1 "$GOOD_PORT"
+    assert_output "$signature_mode cache performs exactly one CRL signature verification" \
+        test "$(wc -l < "$signature_log")" -eq 1
+    assert_output "$signature_mode cache preserves HTTP reuse behavior" fetch_count_is "$signature_fetches"
+    assert_output "$signature_mode cache retains valid revocation evidence" \
+        json_matches 'length == 1 and (.[0] | .overall == "VALID" and .revocation == "NOT REVOKED")' /tmp/functest.out
+done
+printf '127.0.0.1 %s\n127.0.0.1 %s\n127.0.0.1 %s\n' \
+    "$GOOD_PORT" "$GOOD_PORT" "$GOOD_PORT" > "$PKI_DIR/hosts-signature.txt"
+: > "$signature_log"
+: > "$CHECKCRT_TEST_FETCH_LOG"
+check_exit "parallel cache verifies a shared CRL separately for each host" 0 \
+    env PATH="$legacy_path" CHECKCRT_TEST_CRL_VERIFY_LOG="$signature_log" \
+    "$check" "${cache_args[@]}" --cache-dir "$PKI_DIR/signature-cache" \
+    --parallel 3 --hosts-file "$PKI_DIR/hosts-signature.txt" --json
+assert_output "three hosts perform three CRL signature verifications" \
+    test "$(wc -l < "$signature_log")" -eq 3
+assert_output "parallel signature verification reuses downloaded data" fetch_count_is 0
+assert_output "parallel signature verification retains every host result" \
+    json_matches 'length == 3 and all(.[]; .overall == "VALID")' /tmp/functest.out
+
 # Both supported HTTP encodings must be normalized before cache publication.
 openssl crl -in "$PKI_DIR/original.crl" -outform DER -out "$PKI_DIR/www/intermediate.crl"
 openssl x509 -in "$PKI_DIR/certs/intermediate.pem" -outform DER -out "$PKI_DIR/www/intermediate.crt"
@@ -598,17 +634,41 @@ assert_output "DER AIA cache entry contains PEM" grep -q '^-----BEGIN CERTIFICAT
 cp "$PKI_DIR/original.crl" "$PKI_DIR/www/intermediate.crl"
 cp "$PKI_DIR/certs/intermediate.pem" "$PKI_DIR/www/intermediate.crt"
 
-# A leftover lock from an interrupted process must not hang or reuse stale data.
+# Slow shared downloads must not trigger the former five-second bypass.
+printf '127.0.0.1 %s\n127.0.0.1 %s\n127.0.0.1 %s\n' \
+    "$GOOD_PORT" "$GOOD_PORT" "$GOOD_PORT" > "$PKI_DIR/hosts-slow-cache.txt"
+: > "$CHECKCRT_TEST_FETCH_LOG"
+check_exit "parallel cache waits for a shared download exceeding five seconds" 0 \
+    env CHECKCRT_TEST_FETCH_DELAY=7 timeout 45 "$check" "${cache_args[@]}" \
+    --parallel 3 --hosts-file "$PKI_DIR/hosts-slow-cache.txt" --json
+assert_output "slow shared CRL is downloaded only once" fetch_count_is 1
+assert_output "slow download waiters report their wait" \
+    grep -q 'Cache WAIT (CRL)' /tmp/functest.err
+assert_output "slow shared download preserves all host results" \
+    json_matches 'length == 3 and all(.[]; .overall == "VALID")' /tmp/functest.out
+
+# A lock file remains after its owner exits, but its kernel lock is released.
 seed_cache "$cached_crl" "$PKI_DIR/stale.crl"
+(
+    exec 9>>"$cached_crl.lock"
+    flock -x 9
+)
+: > "$CHECKCRT_TEST_FETCH_LOG"
+check_exit "lock file from an exited owner does not block a refresh" 0 \
+    timeout 15 "$check" "${cache_args[@]}" --cache-dir "$persistent_cache" 127.0.0.1 "$GOOD_PORT"
+assert_output "released lock permits one fresh HTTP request" fetch_count_is 1
+assert_output "lock files remain available for other waiters" test -f "$cached_crl.lock"
+
+# Refuse incompatible legacy locks without downloading around them.
+seed_cache "$cached_crl" "$PKI_DIR/stale.crl"
+mv "$cached_crl.lock" "$PKI_DIR/released-lock"
 mkdir "$cached_crl.lock"
 : > "$CHECKCRT_TEST_FETCH_LOG"
-check_exit "abandoned cache lock falls back to a bounded uncached fetch" 0 \
+check_exit "legacy lock directory prevents an uncoordinated fetch" 3 \
     timeout 15 "$check" "${cache_args[@]}" --cache-dir "$persistent_cache" 127.0.0.1 "$GOOD_PORT"
-assert_output "busy lock still permits a fresh HTTP request" fetch_count_is 1
-assert_output "busy lock fallback is explained" \
-    grep -q 'Cache BYPASS (CRL): NOT USED; cache unavailable/busy' /tmp/functest.err
-assert_output "busy lock is not also logged as a normal miss" \
-    test "$(grep -c 'Cache MISS (CRL)' /tmp/functest.out)" = 0
+assert_output "unavailable locking makes no HTTP requests" fetch_count_is 0
+assert_output "unavailable locking is explained" \
+    grep -q 'Cache ERROR (CRL): cannot open cache lock' /tmp/functest.err
 
 echo
 echo "Functional tests: $pass passed, $fail failed."

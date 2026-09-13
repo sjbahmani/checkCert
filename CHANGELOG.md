@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.14.4
+
+- Eliminate duplicate CRL signature verification within each fetch and its
+  caller. Verify both cached and fresh CRLs against the current certificate's
+  issuer, then retain freshness and per-certificate serial checks at use time.
+- Coalesce parallel cache misses with blocking per-object locks, including
+  across runs sharing a cache. Wait for in-progress downloads instead of
+  starting duplicate requests after five seconds. Recheck every five seconds
+  while busy, then revalidate and reuse the published result. Different
+  objects still download concurrently.
+- Use util-linux `flock` for caching, avoiding repeated cache validation while
+  waiting and releasing locks automatically when their holding processes exit.
+  Locking failures stop the fetch instead of bypassing coordination.
+
 ## 1.14.3
 
 - Reject signed CRLs whose `nextUpdate` is at or before `lastUpdate`, even

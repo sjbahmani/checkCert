@@ -3,6 +3,9 @@
 # installed version. All other operations preserve their native exit status.
 set -uo pipefail
 if [[ "${1:-}" == crl && " $* " == *' -verify '* ]]; then
+    if [[ -n "${CHECKCRT_TEST_CRL_VERIFY_LOG:-}" ]]; then
+        printf '%s\n' "$*" >> "$CHECKCRT_TEST_CRL_VERIFY_LOG"
+    fi
     output=$("$CHECKCRT_TEST_OPENSSL_BIN" "$@" 2>&1)
     result=$?
     printf '%s\n' "$output" >&2

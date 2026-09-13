@@ -7,4 +7,7 @@ if [[ -e "$CHECKCRT_TEST_OFFLINE" ]]; then
     echo 'Simulated CRL/AIA HTTP outage' >&2
     exit 22
 fi
+if [[ -n "${CHECKCRT_TEST_FETCH_DELAY:-}" ]]; then
+    sleep "$CHECKCRT_TEST_FETCH_DELAY"
+fi
 exec "$CHECKCRT_TEST_FETCH_BIN" "$@"

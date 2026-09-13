@@ -13,9 +13,11 @@ and AIA issuer URLs are detected and skipped with a clear message, since they
 cannot be fetched by `curl`/`wget` in this script. `dig`, `host`, or
 `nslookup` (any one of them) is required for the CAA record lookup; the
 lookup is skipped, not fatal, when none are installed.
-Persistent caching (`--cache-dir`) also uses GNU `stat` to check directory
-permissions. Cache file operations use standard GNU coreutils (`cp`, `mv`,
-`mkdir`, and `rmdir`); no additional service or runtime JSON tool is needed.
+Caching requires `flock` from util-linux for shared-download coordination;
+`--no-cache` does not require it. Persistent caching (`--cache-dir`) also uses
+GNU `stat` to check directory permissions. Cache file operations use standard
+GNU coreutils (`cp`, `mv`, and `mkdir`); no additional service or runtime JSON
+tool is needed.
 
 ## Usage
 
@@ -138,6 +140,11 @@ An AIA certificate must match the expected issuer and verify the leaf. The
 normal trust-store, identity, expiry, and revocation checks still run: cached
 issuers are **not** added to the trust store, and a CRL is checked separately
 against every certificate's serial number. Whole-host verdicts are never cached.
+Within one CRL fetch and its caller, the signature is verified once against
+that certificate's issuer, whether the CRL is cached or freshly downloaded.
+The caller reuses that verification for the same private file but still checks
+freshness at use time and checks the certificate's serial number. Signature
+verification results are not shared between hosts or stored in the cache.
 
 OCSP caching saves the signed response bytes, not just a `good`/`revoked`
 string. Keys include the responder URL and the certificate and issuer
@@ -165,10 +172,30 @@ timestamps cause a fresh download. If refreshing fails, stale evidence is
 never used as a fallback; without another usable revocation source the result
 remains `UNKNOWN`.
 Fresh verified downloads are published atomically under hashed request keys,
-so parallel readers cannot see a partially-written entry. Per-key locks
-coalesce concurrent downloads. A busy/abandoned lock is waited on for about
-five seconds, then the check downloads without caching. Cache write failures
-also allow the normal check to continue.
+so parallel readers cannot see a partially-written entry. Blocking per-key
+locks coalesce concurrent downloads, including separate invocations sharing
+the same cache directory. Workers reuse valid cache entries immediately.
+On a miss, one worker downloads while others needing that key sleep in
+`flock`, without repeatedly copying or validating the old entry. Downloads
+for different keys remain concurrent.
+
+After five seconds, a waiter rechecks the lock and keeps waiting if the shared
+download is still running. It can proceed sooner if the lock is released.
+There is no five-second bypass: waiters acquire the lock after its owner
+finishes, revalidate the cache, and reuse the published object. If a download
+fails or produces no usable entry, the next lock holder may retry. Network
+request timeouts and retries still apply to the downloader. The kernel
+releases a lock when its last holding descriptor closes, including when
+processes exit unexpectedly; the empty lock file remains and must not be
+deleted while checks are running.
+
+If locking is unavailable, the fetch fails instead of starting an
+uncoordinated download. Legacy `.lock` directories from older versions must
+be removed only after all checks using that cache have stopped; they are
+not bypassed. Do not share a cache between concurrently running old and new
+versions. Cache publication failures still allow the owner to use its verified
+download, but subsequent workers may need to download it again. Stale,
+malformed, and unverifiable data are never reused just to avoid a download.
 
 Full reports identify the cache mode (`PER-RUN`, `PERSISTENT`, or `DISABLED`)
 for each host; persistent mode also shows the directory. Every CRL/AIA/OCSP fetch
@@ -178,10 +205,12 @@ explicitly logs whether cached evidence was used:
   Cache HIT (CRL): USED verified cached download (age: 42s)
   Cache HIT (OCSP): USED verified cached download (age: 42s)
   Cache MISS (AIA): NOT USED; no fresh verified entry, downloading
+  Cache WAIT (CRL): shared download still in progress; waiting again
   Cache BYPASS (CRL): NOT USED; disabled by --no-cache, downloading
 ```
 
-Unavailable caches and busy locks log `BYPASS` with the reason. The mode line
+Busy locks log `WAIT`; locking failures log `ERROR` and prevent that fetch.
+`--no-cache` logs `BYPASS` and explicitly disables coordination. The mode line
 describes configuration, not proof of a hit: `USED` is logged only after
 cached evidence passes validation. Hosts needing no CRL/AIA/OCSP requests have
 no per-fetch cache messages.
@@ -427,7 +456,8 @@ intermediate (regression test for AIA-based chain recovery), `--connect-ip`
 with hostname/SNI preservation and mismatch rejection, and `--hosts-file`
 batch mode. Cache regressions count real HTTP fetches for sequential/parallel
 reuse, persistent hits during HTTP outages, TTL and CRL freshness, invalid
-signatures/issuers, safe file publishing, and abandoned locks. JSON assertions
+signatures/issuers, safe file publishing, slow shared downloads, and lock reuse.
+JSON assertions
 use `jq`. IPv6 connections are tested when loopback IPv6 is available.
 The OCSP suite uses a BusyBox CGI responder to sign real requests with a
 disposable CA, counts HTTP requests, and tests cache identity isolation,
