@@ -9,7 +9,7 @@
 
 set -u -o pipefail
 
-VERSION=1.14.3
+VERSION=1.14.4
 verify_peer=1
 ca_file=
 ca_path=
@@ -108,7 +108,13 @@ while (( $# > 0 )); do
         --cache-dir|--cache-max-age|--connect-ip|--connect-timeout|--request-timeout|--connect-retries|--retry-delay|--max-ocsp-age|--clock-skew|--proxy|--no-proxy|--ca-path|--starttls|--expiry-warn-days|--hosts-file|--parallel)
             option_name=$1
             shift
-            [[ $# -gt 0 ]] || { echo "Error: $option_name requires a value." >&2; exit 1; }
+            if (( $# == 0 )); then
+                echo "Error: $option_name requires a value." >&2
+                exit 1
+            elif [[ "$1" == --* ]]; then
+                echo "Error: $option_name requires a value (got '$1', which looks like another option)." >&2
+                exit 1
+            fi
             case $option_name in
                 --cache-dir) cache_dir=$1; cache_dir_set=1 ;;
                 --cache-max-age) cache_max_age=$1 ;;
@@ -130,7 +136,13 @@ while (( $# > 0 )); do
             ;;
         --ca-file)
             shift
-            [[ $# -gt 0 ]] || { echo "Error: --ca-file requires a file path." >&2; exit 1; }
+            if (( $# == 0 )); then
+                echo "Error: --ca-file requires a file path." >&2
+                exit 1
+            elif [[ "$1" == --* ]]; then
+                echo "Error: --ca-file requires a file path (got '$1', which looks like another option)." >&2
+                exit 1
+            fi
             ca_file=$1
             ;;
         --ca-file=*) ca_file=${1#--ca-file=} ;;
@@ -518,22 +530,24 @@ fetch_cached_object() (
             [[ "$kind" == ocsp ]] && entry="$cache_dir/v1-ocsp-$key.ocsp"
             lock_dir="$entry.lock"
             if cache_read "$kind" "$entry" "$destination" "$verifier" "$cert" "$report"; then exit 0; fi
-            while :; do
-                if (umask 077; mkdir -- "$lock_dir") 2>/dev/null; then
-                    lock_held=1
-                    # Another worker may have published after our first read.
-                    if cache_read "$kind" "$entry" "$destination" "$verifier" "$cert" "$report"; then exit 0; fi
-                    break
-                fi
+            if (umask 077; mkdir -- "$lock_dir") 2>/dev/null; then
+                lock_held=1
+                # Another worker may have published after our first read.
                 if cache_read "$kind" "$entry" "$destination" "$verifier" "$cert" "$report"; then exit 0; fi
-                # A missing lock here can mean its owner just published and
-                # released it, not a cache failure. Retry the read/acquisition.
-                if [[ ! -d "$cache_dir" || ! -w "$cache_dir" || -L "$lock_dir" ]] || (( SECONDS >= lock_deadline )); then
-                    echo "  Cache BYPASS (${kind^^}): NOT USED; cache unavailable/busy, downloading without caching." >&2
-                    break
-                fi
-                sleep 0.1
-            done
+            else
+                # The owner publishes before releasing its lock. Poll only
+                # the lock, not an unchanged, unusable entry: revalidating it
+                # on every tick repeats copying and OpenSSL work per waiter.
+                while [[ -d "$lock_dir" && ! -L "$lock_dir" && -w "$cache_dir" ]] \
+                    && (( SECONDS < lock_deadline )); do
+                    sleep 0.1
+                done
+                if cache_read "$kind" "$entry" "$destination" "$verifier" "$cert" "$report"; then exit 0; fi
+                # If the owner failed to publish usable evidence, do not take
+                # turns retrying under the same lock. Waiters fetch in parallel
+                # without caching; all normal caller validation still applies.
+                echo "  Cache BYPASS (${kind^^}): NOT USED; cache unavailable/busy or shared download unusable, downloading without caching." >&2
+            fi
             if (( lock_held == 1 )); then
                 printf '  Cache MISS (%s): NOT USED; no fresh verified entry, downloading\n' "${kind^^}"
             fi
