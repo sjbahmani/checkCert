@@ -53,6 +53,27 @@ vbank.rqb.ir
 tourismbank.ir
 ibank.tourism-bank.com
 vbank.tourismbank.ir
+shaparak.ir
+sep.shaparak.ir
+sadad.shaparak.ir
+bpm.shaparak.ir
+pec.shaparak.ir
+asan.shaparak.ir
+pep.shaparak.ir
+ikc.shaparak.ir
+fcp.shaparak.ir
+fanava.shaparak.ir
+pna.shaparak.ir
+sepehr.shaparak.ir
+ecd.shaparak.ir
+
+behpardakht.ir
+sadadpsp.ir
+asanpardakht.ir
+pec.ir
+sep.ir
+pep.co.ir
+
 
 
 # Marketplace / ride-hailing / e-commerce
