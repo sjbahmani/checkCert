@@ -30,7 +30,7 @@ grep -q -- '--cache-max-age' "$scratch/stdout"
 grep -q -- '--cache-max-age .*default: 86400;' "$scratch/stdout"
 grep -q -- '--no-cache' "$scratch/stdout"
 expect_exit 0 "$script" --version
-grep -q '^checkCRT.sh 1\.15\.0$' "$scratch/stdout"
+grep -q '^checkCRT.sh 1\.16\.0$' "$scratch/stdout"
 expect_exit 1 "$script" --connect-timeout 0 example.com
 grep -q 'positive number' "$scratch/stderr"
 expect_exit 1 "$script" --ca-file "$scratch/missing.pem" example.com
@@ -85,5 +85,10 @@ grep -q -- '--cache-dir must not be group- or world-writable' "$scratch/stderr"
 ln -s "$scratch/shared-cache" "$scratch/link-cache"
 expect_exit 1 "$script" --cache-dir "$scratch/link-cache///" example.com
 grep -q -- '--cache-dir must be a readable/writable directory' "$scratch/stderr"
+
+for invalid_delay in -1 text 1.5 9999999999; do
+    expect_exit 1 "$script" --retry-delay "$invalid_delay" example.com
+    grep -q -- '--retry-delay must be a non-negative integer' "$scratch/stderr"
+done
 
 echo 'CLI regression tests passed.'

@@ -9,7 +9,7 @@
 
 set -u -o pipefail
 
-VERSION=1.15.0
+VERSION=1.16.0
 verify_peer=1
 ca_file=
 ca_path=
@@ -58,6 +58,7 @@ Options:
   --cache-dir DIR     Keep verified CRL/AIA/OCSP data between runs in a private
                       directory. By default, the cache lasts only this run.
                       Shared downloads wait for a per-object lock (uses flock).
+                      Failed shared requests have a 10-second cooldown.
   --cache-max-age N   Maximum cached download age in seconds (default: 86400;
                       24 hours).
                       CRL/OCSP entries are never reused past nextUpdate.
@@ -67,7 +68,9 @@ Options:
   --connect-retries N Retry a failed network operation (initial TLS
                       connection, CRL download, or OCSP query) up to N
                       extra times (default: 3; 0 disables retrying).
-  --retry-delay N     Seconds to wait between connection retries (default: 1).
+                      Only temporary transport/HTTP failures are retried.
+  --retry-delay N     Initial retry delay in seconds (default: 1; 0 disables
+                      waiting). Doubles each retry, capped at 6 seconds.
   --max-ocsp-age N    Maximum OCSP response age in seconds (default: 86400
                       for leaf/no-nextUpdate responses). CA responses with
                       nextUpdate use its signed deadline unless N is set.
@@ -260,10 +263,11 @@ if ! [[ "$connect_retries" =~ ^[0-9]+$ ]]; then
     echo "Error: --connect-retries must be a non-negative integer." >&2
     exit 1
 fi
-if ! [[ "$retry_delay" =~ ^[0-9]+$ ]]; then
-    echo "Error: --retry-delay must be a non-negative number of seconds." >&2
+if ! [[ "$retry_delay" =~ ^[0-9]{1,9}$ ]]; then
+    echo "Error: --retry-delay must be a non-negative integer of at most 9 digits (seconds)." >&2
     exit 1
 fi
+retry_delay=$((10#$retry_delay))
 if ! [[ "$batch_parallel" =~ ^[0-9]+$ ]] || (( batch_parallel < 1 )); then
     echo "Error: --parallel must be a positive integer." >&2
     exit 1
@@ -446,28 +450,112 @@ emit_error_json() {
         "$batch_elapsed" "$batch_cache_hits" "$batch_cache_misses" >&3
 }
 
+retry_wait() {
+    local retry_number=$1 operation=$2 delay=$retry_delay step max_delay=6
+    (( delay > max_delay )) && delay=$max_delay
+    for (( step = 1; step < retry_number && delay > 0 && delay < max_delay; step++ )); do
+        delay=$((delay * 2))
+        (( delay > max_delay )) && delay=$max_delay
+    done
+    printf '%s failed; retry %s/%s in %ss ...\n' "$operation" "$retry_number" "$connect_retries" "$delay" >&2
+    if (( delay > 0 )); then sleep "$delay"; fi
+}
+
 fetch() {
-    local url=$1 destination=$2
-    local fetch_attempt=0
+    local url=$1 destination=$2 request=${3:-} operation=${4:-Download}
+    local fetch_attempt=0 fetch_rc http_status retryable errors="$2.errors"
+    local -a curl_args wget_args
+    fetch_failure_shared=0
     while :; do
+        retryable=0
+        fetch_failure_shared=0
+        http_status=
         if command -v curl >/dev/null 2>&1; then
-            curl_args=(--fail --location --silent --show-error --connect-timeout "$connect_timeout" --max-time "$request_timeout")
+            curl_args=(--fail --location --silent --show-error --retry 0 --connect-timeout "$connect_timeout" --max-time "$request_timeout")
             [[ -n "$proxy" ]] && curl_args+=(--proxy "$proxy")
             [[ -n "$no_proxy" ]] && curl_args+=(--noproxy "$no_proxy")
-            curl "${curl_args[@]}" --output "$destination" "$url" && return 0
+            if [[ -n "$request" ]]; then
+                curl_args+=(--header 'Content-Type: application/ocsp-request'
+                    --header 'Accept: application/ocsp-response' --data-binary "@$request")
+            fi
+            if http_status=$(curl "${curl_args[@]}" --write-out '%{http_code}' --output "$destination" "$url"); then return 0
+            else fetch_rc=$?; fi
+            case "$fetch_rc" in
+                5|6|7|16|18|28|52|55|56|92) retryable=1; fetch_failure_shared=1 ;;
+                22)
+                    [[ "$http_status" =~ ^[45][0-9]{2}$ ]] && fetch_failure_shared=1
+                    http_status_is_temporary "$http_status" && retryable=1 ;;
+            esac
         elif command -v wget >/dev/null 2>&1; then
-            wget_args=(--quiet --timeout="$connect_timeout" --tries=2 --output-document="$destination")
+            wget_args=(--no-verbose --server-response --dns-timeout="$connect_timeout"
+                --connect-timeout="$connect_timeout" --read-timeout="$request_timeout"
+                --tries=1 --output-document="$destination")
             [[ -n "$proxy" ]] && wget_args+=(-e use_proxy=yes -e "http_proxy=$proxy" -e "https_proxy=$proxy")
             [[ -n "$no_proxy" ]] && wget_args+=(-e "no_proxy=$no_proxy")
-            wget "${wget_args[@]}" "$url" && return 0
+            if [[ -n "$request" ]]; then
+                wget_args+=(--header='Content-Type: application/ocsp-request'
+                    --header='Accept: application/ocsp-response' --post-file="$request")
+            fi
+            if timeout "$request_timeout" wget "${wget_args[@]}" "$url" 2>"$errors"; then return 0
+            else fetch_rc=$?; fi
+            cat "$errors" >&2
+            http_status=$(http_status_from_report "$errors")
+            case "$fetch_rc" in
+                4|124) retryable=1; fetch_failure_shared=1 ;;
+                8)
+                    [[ "$http_status" =~ ^[45][0-9]{2}$ ]] && fetch_failure_shared=1
+                    http_status_is_temporary "$http_status" && retryable=1 ;;
+            esac
         else
-            echo "Error: curl or wget is required to download CRLs." >&2
+            echo "Error: curl or wget is required for CRL/AIA/OCSP requests." >&2
             return 1
         fi
+        (( retryable == 1 )) || return 1
         (( fetch_attempt >= connect_retries )) && return 1
         fetch_attempt=$((fetch_attempt + 1))
-        (( retry_delay > 0 )) && sleep "$retry_delay"
+        retry_wait "$fetch_attempt" "$operation"
     done
+}
+
+http_status_is_temporary() {
+    case "$1" in 408|429|500|502|503|504) return 0 ;; *) return 1 ;; esac
+}
+
+http_status_from_report() {
+    # Wget response headers and OpenSSL HTTP error reports, including redirects.
+    sed -nE -e 's/^[[:space:]]*HTTP\/[0-9.]+ ([0-9]{3}).*/\1/p' \
+        -e 's/.*[Cc]ode[=:][[:space:]]*([0-9]{3}).*/\1/p' "$1" | tail -1
+}
+
+openssl_failure_is_temporary() {
+    local rc=$1 report=$2 status
+    (( rc == 124 )) && return 0
+    status=$(http_status_from_report "$report")
+    if [[ -n "$status" ]]; then http_status_is_temporary "$status"; return; fi
+    # Retry transport interruptions, not arbitrary TLS/protocol/verification errors.
+    LC_ALL=C grep -Eqi 'connection (refused|reset|timed out|closed)|network is unreachable|no route to host|temporary failure in name resolution|resource temporarily unavailable|unexpected eof while reading|connect:errno=(11|101|104|110|111|113)$' "$report"
+}
+
+cache_failure_is_recent() {
+    local file=$1 header failed_at now
+    [[ -f "$file" && ! -L "$file" ]] || return 1
+    IFS= read -r header < "$file" || return 1
+    [[ "$header" =~ ^'# checkCRT-failure-v1 '([0-9]{1,12})$ ]] || return 1
+    failed_at=$((10#${BASH_REMATCH[1]}))
+    now=$(date -u +%s)
+    (( failed_at <= now && now - failed_at < 10 ))
+}
+
+cache_record_failure() {
+    # Called under the object lock, only for remote request failures. Policy or
+    # issuer-specific verification failures must not suppress another caller.
+    if (( lock_held == 1 && fetch_failure_shared == 1 )); then
+        if cache_temp=$(mktemp "$cache_dir/.checkcrt-failure.XXXXXX") \
+            && printf '# checkCRT-failure-v1 %s\n' "$(date -u +%s)" > "$cache_temp" \
+            && mv -fT -- "$cache_temp" "$entry.failed"; then
+            cache_temp=
+        fi
+    fi
 }
 
 crl_signature_is_valid() {
@@ -557,6 +645,7 @@ fetch_cached_object() (
     local kind=$1 url=$2 destination=$3 verifier=${4:-} cert=${5:-} report=${6:-} is_ca=${7:-0}
     local key entry='' lock_file='' lock_fd lock_rc lock_held=0 cache_temp=''
     local decoder fetched_at cert_fp issuer_fp cacheable=0
+    local fetch_failure_shared=0
     trap '[[ -z "$cache_temp" ]] || rm -f -- "$cache_temp"' EXIT
     if (( cache_enabled == 1 )); then
         if [[ "$kind" == ocsp ]]; then
@@ -601,6 +690,13 @@ fetch_cached_object() (
             # The previous owner may have published while we were waiting.
             # Every host verifies the result against its own certificate.
             if cache_read "$kind" "$entry" "$destination" "$verifier" "$cert" "$report" "$is_ca"; then exit 0; fi
+            if cache_failure_is_recent "$entry.failed"; then
+                printf '  Cache COOLDOWN (%s): shared request failed within the last 10s; download skipped\n' "${kind^^}"
+                if [[ "$kind" == ocsp ]]; then
+                    echo 'Shared OCSP request failed recently; download skipped during the 10s cooldown.' > "$report"
+                fi
+                exit 1
+            fi
             printf 'M\n' >> "$host_cache_events"
             printf '  Cache MISS (%s): NOT USED; no fresh verified entry, downloading\n' "${kind^^}"
         else
@@ -612,9 +708,9 @@ fetch_cached_object() (
     fi
     fetched_at=$(date -u +%s)
     if [[ "$kind" == ocsp ]]; then
-        if ! fetch_ocsp_response "$url" "$destination" "$cert" "$verifier" "$report" "$is_ca"; then exit 1; fi
+        if ! fetch_ocsp_response "$url" "$destination" "$cert" "$verifier" "$report" "$is_ca"; then cache_record_failure; exit 1; fi
     else
-        if ! fetch "$url" "$destination.download"; then exit 1; fi
+        if ! fetch "$url" "$destination.download"; then cache_record_failure; exit 1; fi
         decoder=crl
         [[ "$kind" == aia ]] && decoder=x509
         if openssl "$decoder" -inform DER -in "$destination.download" -out "$destination" >/dev/null 2>&1; then :
@@ -691,21 +787,15 @@ ocsp_verify_response() {
 }
 
 fetch_ocsp_response() {
-    local url=$1 response=$2 cert=$3 verifier=$4 report=$5 is_ca=${6:-0} attempt=0
-    local -a ocsp_proxy_args=() age_args=()
-    if (( is_ca == 0 || max_ocsp_age_set == 1 )); then age_args=(-status_age "$max_ocsp_age"); fi
-    [[ -n "$proxy" ]] && ocsp_proxy_args+=(-proxy "$proxy")
-    [[ -n "$no_proxy" ]] && ocsp_proxy_args+=(-no_proxy "$no_proxy")
-    while :; do
-        : > "$response"
-        if timeout "$request_timeout" openssl ocsp -issuer "$verifier" -cert "$cert" -url "$url" \
-            -no_nonce -CAfile "$verifier" -partial_chain -validity_period "$clock_skew" \
-            "${age_args[@]}" -respout "$response" "${ocsp_proxy_args[@]}" > "$report" 2>&1 \
-            && ocsp_verify_response "$response" "$cert" "$verifier" "$report" "$is_ca"; then return 0; fi
-        (( attempt >= connect_retries )) && return 1
-        attempt=$((attempt + 1))
-        (( retry_delay > 0 )) && sleep "$retry_delay"
-    done
+    local url=$1 response=$2 cert=$3 verifier=$4 report=$5 is_ca=${6:-0} request="$2.request"
+    fetch_failure_shared=0
+    openssl ocsp -issuer "$verifier" -cert "$cert" -no_nonce -reqout "$request" > "$report" 2>&1 || return 1
+    # OpenSSL can hide an HTTP failure behind a content-type error. Use the
+    # common transport to preserve HTTP status, deadlines, proxy settings, and
+    # retry classification; OpenSSL still verifies the exact returned bytes.
+    fetch "$url" "$response" "$request" 'OCSP request' >> "$report" 2>&1 || return 1
+    fetch_failure_shared=0
+    ocsp_verify_response "$response" "$cert" "$verifier" "$report" "$is_ca"
 }
 
 crl_has_serial_for() {
@@ -829,7 +919,7 @@ check_host_details() {
     port=$((10#${BASH_REMATCH[1]}))
 
     local host_workdir connection_host transport_host is_ip sni_args connect_target starttls_args
-    local connect_attempt connect_ok
+    local connect_attempt connect_ok connect_rc
     local -a warnings=()
     local leaf stapled_ocsp leaf_eku retry_workdir retry_eku status_retry_used=0
     local negotiated_protocol negotiated_cipher
@@ -894,16 +984,17 @@ check_host_details() {
     connect_ok=0
     while :; do
         if timeout "$connect_timeout" openssl s_client -connect "$connect_target" "${sni_args[@]}" \
-            "${starttls_args[@]}" -showcerts -status </dev/null >"$host_workdir/s_client.txt" 2>/dev/null; then
+            "${starttls_args[@]}" -showcerts -status </dev/null >"$host_workdir/s_client.txt" 2>"$host_workdir/tls-errors.txt"; then
             connect_ok=1
             break
-        fi
+        else connect_rc=$?; fi
+        openssl_failure_is_temporary "$connect_rc" "$host_workdir/tls-errors.txt" || break
         (( connect_attempt >= connect_retries )) && break
         connect_attempt=$((connect_attempt + 1))
-        echo "Connection attempt $connect_attempt/$connect_retries failed; retrying in ${retry_delay}s ..." >&2
-        (( retry_delay > 0 )) && sleep "$retry_delay"
+        retry_wait "$connect_attempt" "TLS connection"
     done
     if (( connect_ok == 0 )); then
+        cat "$host_workdir/tls-errors.txt" >&2
         echo "Error: unable to connect, negotiate STARTTLS, or retrieve the certificate chain." >&2
         emit_error_json "$domain" "$port" "unable to connect, negotiate STARTTLS, or retrieve the certificate chain"
         return 3

@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.16.0
+
+- Align wget with curl: one client attempt per retry, configured connection
+  and read timeouts, and an overall request deadline.
+- Send OCSP requests through the same HTTP transport so status codes, proxies,
+  and connection/request timeouts are handled consistently. OpenSSL still
+  constructs the request and verifies the signed response.
+- Retry temporary transport errors and HTTP 408, 429, 500, 502, 503, and 504.
+  Stop retrying permanent HTTP, TLS/protocol, and OCSP verification failures.
+- Share a 10-second cooldown after remote request failures through the cache,
+  preventing waiting workers from repeating an exhausted retry sequence.
+  Cooldowns provide no revocation evidence or cache hits and never override
+  a usable verified cache entry. Verification failures are not shared.
+- Use exponential backoff for TLS, CRL/AIA, and OCSP retries. `--retry-delay`
+  sets the initial delay (default 1 second), doubling for each retry up to
+  6 seconds. The default three retries wait 1, 2, and 4 seconds; zero disables
+  waiting. Report the actual delay and retry number for each operation.
+
 ## 1.15.0
 
 - Skip CRL downloads when the certificate's actual issuer is unavailable,

@@ -81,7 +81,13 @@ cache_path() {
 good_entry=$(cache_path good issuer leaf)
 revoked_entry=$(cache_path revoked issuer leaf)
 issuer_entry=$(cache_path issuer root root)
-set_mode() { printf '%s\n' "$1" > "$fixture_dir/mode"; : > "$fixture_dir/requests.log"; }
+set_mode() {
+    printf '%s\n' "$1" > "$fixture_dir/mode"
+    : > "$fixture_dir/requests.log"
+    # Each scenario starts independently; cooldown regressions below deliberately
+    # keep the same mode/markers across calls.
+    find "$fixture_dir" -name '*.failed' -type f -delete
+}
 retime() { sed "1c# checkCRT-cache-v1 $3" "$1" > "$2"; }
 
 check_exit 'OCSP cold cache verifies leaf and intermediate' 0 \
@@ -263,6 +269,49 @@ for ca_mode in dynamic no-next; do
             json_matches '.[0].cache_hits == 0 and .[0].cache_misses == 2'
     fi
 done
+
+# Each response starts its own retry sequence. Only sleep is replaced; queries
+# still reach the local responder and failures must retain UNKNOWN status.
+mkdir "$fixture_dir/retry-bin"
+cp "$script_dir/retry_sleep.sh" "$fixture_dir/retry-bin/sleep"
+chmod +x "$fixture_dir/retry-bin/sleep"
+export CHECKCRT_TEST_SLEEP_LOG="$fixture_dir/retry-sleep.log"
+for retry_base in 1 0; do
+    set_mode offline
+    : > "$CHECKCRT_TEST_SLEEP_LOG"
+    check_exit "OCSP retries with initial delay $retry_base" 3 \
+        env PATH="$fixture_dir/retry-bin:$PATH" "$check" "${args[@]}" \
+        --connect-retries 3 --retry-delay "$retry_base" --cache-dir "$fixture_dir/retry-cache-$retry_base" \
+        127.0.0.1 "$good_port"
+    assert "OCSP makes four attempts per response with delay $retry_base" requests 8
+    expected_delays='1,2,4,1,2,4'
+    [[ "$retry_base" != 0 ]] || expected_delays=''
+    assert "OCSP backoff resets for each response with delay $retry_base" \
+        test "$(paste -sd, "$CHECKCRT_TEST_SLEEP_LOG")" = "$expected_delays"
+done
+
+# Permanent failures must not repeat queries, even with retries enabled.
+for mode in not-found badsig wrong-id wrong-signer; do
+    set_mode "$mode"
+    : > "$CHECKCRT_TEST_SLEEP_LOG"
+    check_exit "OCSP permanent $mode failure stops retrying" 3 \
+        env PATH="$fixture_dir/retry-bin:$PATH" "$check" "${args[@]}" \
+        --connect-retries 3 --retry-delay 1 --cache-dir "$fixture_dir/permanent-$mode" \
+        127.0.0.1 "$good_port"
+    assert "OCSP $mode does not repeat either response request" requests 2
+    assert "OCSP $mode does not wait for retries" test ! -s "$CHECKCRT_TEST_SLEEP_LOG"
+done
+
+set_mode offline
+printf '127.0.0.1 %s\n127.0.0.1 %s\n127.0.0.1 %s\n' \
+    "$good_port" "$good_port" "$good_port" > "$fixture_dir/cooldown-hosts"
+check_exit 'OCSP parallel failures share one request per response' 1 \
+    "$check" "${args[@]}" --cache-dir "$fixture_dir/cooldown-cache" \
+    --parallel 3 --hosts-file "$fixture_dir/cooldown-hosts" --json
+assert 'OCSP cooldown suppresses repeated queries from waiting hosts' requests 2
+assert 'OCSP cooldown never supplies positive evidence or cache hits' \
+    json_matches 'length == 3 and all(.[]; .overall == "UNKNOWN" and .cache_hits == 0) and ([.[].cache_misses] | add) == 2'
+assert 'OCSP reports shared failure cooldown' grep -q 'Cache COOLDOWN (OCSP)' "$err"
 
 set_mode root-revoked
 check_exit 'OCSP detects a revoked intermediate with a good leaf' 2 \

@@ -207,9 +207,15 @@ for different keys remain concurrent.
 After five seconds, a waiter rechecks the lock and keeps waiting if the shared
 download is still running. It can proceed sooner if the lock is released.
 There is no five-second bypass: waiters acquire the lock after its owner
-finishes, revalidate the cache, and reuse the published object. If a download
-fails or produces no usable entry, the next lock holder may retry. Network
-request timeouts and retries still apply to the downloader. The kernel
+finishes, revalidate the cache, and reuse the published object. A remote request
+failure starts a shared 10-second cooldown after the downloader finishes its
+attempts. During that window, other workers report `Cache COOLDOWN` and skip
+the request; they count neither a hit nor another miss. After the window expires,
+the next caller may try again. Valid verified cache entries always take priority.
+Local errors and signature/freshness verification failures are not shared, since
+callers may use different issuers or validation policies. `--no-cache` also
+disables shared cooldowns. Network request timeouts and retries still apply to
+the downloader. The kernel
 releases a lock when its last holding descriptor closes, including when
 processes exit unexpectedly; the empty lock file remains and must not be
 deleted while checks are running.
@@ -384,15 +390,26 @@ finish. `--proxy` and `--no-proxy` apply
 to CRL and OCSP HTTP requests; direct TLS certificate retrieval is not routed
 through an HTTP proxy.
 
-If a network operation fails (transient blips, filtering, etc.) — the
-initial TLS connection, a CRL download, or an OCSP query — it's retried
-automatically. `--connect-retries` sets how many extra attempts to make for
+Temporary transport failures and HTTP 408, 429, 500, 502, 503, and 504 are
+retried automatically. Other HTTP failures, unsupported TLS/protocol settings,
+and invalid or stale OCSP responses stop without further retries.
+`--connect-retries` sets how many extra attempts to make for
 each of these (default 3; `0` disables retrying) and `--retry-delay` sets
-the pause between attempts in seconds (default 1). This applies per host, so
-in `--hosts-file` batch mode each host gets its own retries. Without this, a
+the initial pause in seconds (default 1; up to 9 digits). The pause doubles
+after each failure, capped at 6 seconds: the default three retries wait
+1, 2, then 4 seconds. `--retry-delay 0` disables waiting. Each TLS connection,
+CRL/AIA download, and OCSP query starts its own backoff sequence; a successful
+attempt stops retrying immediately. In `--hosts-file` batch mode each host
+gets its own retries. Without this, a
 single transient CRL/OCSP failure for a certificate that has no other usable
 revocation source would surface as `REVOCATION: UNKNOWN` even though the
 certificate itself is fine.
+
+Curl and wget both use one client attempt per retry. Wget applies
+`--connect-timeout` to DNS/connect operations, `--request-timeout` to reads,
+and an outer deadline to enforce the total request timeout.
+OCSP uses the same HTTP transport for its request, followed by OpenSSL signature,
+certificate-ID, and freshness verification of the returned response.
 
 ## Exit codes
 

@@ -9,7 +9,11 @@ dd bs=1 count="$CONTENT_LENGTH" of="$request_dir/request.der" 2>/dev/null
 printf '%s\n' "${PATH_INFO:-}" >> "$fixture_dir/requests.log"
 mode=$(< "$fixture_dir/mode")
 if [[ "$mode" == offline ]]; then
-    printf 'Status: 503 Service Unavailable\r\nContent-Type: text/plain\r\n\r\noffline\n'
+    printf 'HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\n\r\noffline\n'
+    exit 0
+fi
+if [[ "$mode" == not-found ]]; then
+    printf 'HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n\r\nmissing\n'
     exit 0
 fi
 ca=issuer
@@ -34,7 +38,7 @@ case "$mode" in
 esac
 if ! openssl ocsp "${args[@]}" >/dev/null 2>"$request_dir/errors"; then
     cat "$request_dir/errors" >&2
-    printf 'Status: 500 Internal Server Error\r\nContent-Type: text/plain\r\n\r\n'
+    printf 'HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\n\r\n'
     cat "$request_dir/errors"
     exit 0
 fi

@@ -405,8 +405,126 @@ fetch_count_is() {
 }
 seed_cache() {
     local destination=$1 source=$2 timestamp=${3:-$(date -u +%s)}
+    rm -f -- "$destination.failed"
     { printf '# checkCRT-cache-v1 %s\n' "$timestamp"; cat "$source"; } > "$destination"
 }
+
+# Observe real retry loops without spending wall-clock time in backoff.
+mkdir "$PKI_DIR/retry-bin"
+cp "$script_dir/retry_sleep.sh" "$PKI_DIR/retry-bin/sleep"
+chmod +x "$PKI_DIR/retry-bin/sleep"
+export CHECKCRT_TEST_SLEEP_LOG="$PKI_DIR/retry-sleep.log"
+check_exit "TLS transient/permanent retry classification" 0 \
+    bash "$script_dir/tls_retry.sh"
+
+for retry_case in default zero capped success decimal; do
+    retry_base=1 retry_count=3 retry_failures=99 retry_exit=3 retry_fetches=4
+    expected_delays='1,2,4'
+    case "$retry_case" in
+        zero) retry_base=0; expected_delays='' ;;
+        capped) retry_base=2; retry_count=4; retry_fetches=5; expected_delays='2,4,6,6' ;;
+        success) retry_failures=2; retry_exit=0; retry_fetches=3; expected_delays='1,2' ;;
+        decimal) retry_base=0002; expected_delays='2,4,6' ;;
+    esac
+    : > "$CHECKCRT_TEST_FETCH_LOG"
+    : > "$CHECKCRT_TEST_SLEEP_LOG"
+    check_exit "download retry policy ($retry_case)" "$retry_exit" \
+        env PATH="$PKI_DIR/retry-bin:$PATH" CHECKCRT_TEST_FETCH_FAILURES="$retry_failures" \
+        "$check" "${cache_args[@]}" --no-cache --connect-retries "$retry_count" \
+        --retry-delay "$retry_base" 127.0.0.1 "$GOOD_PORT"
+    assert_output "download attempt count ($retry_case)" fetch_count_is "$retry_fetches"
+    assert_output "download backoff sequence ($retry_case)" \
+        test "$(paste -sd, "$CHECKCRT_TEST_SLEEP_LOG")" = "$expected_delays"
+done
+
+# Exercise both HTTP clients through the real fetch loop, including response
+# code classification. Hide curl only inside the wget test subprocess.
+without_curl() (
+    # Exported into the checker's Bash process to select the wget fallback.
+    # shellcheck disable=SC2329
+    command() {
+        if [[ "$*" == '-v curl' ]]; then return 1; fi
+        builtin command "$@"
+    }
+    export -f command
+    "$@"
+)
+mkdir "$PKI_DIR/wget-bin"
+cp "$script_dir/fetch_wrapper.sh" "$PKI_DIR/wget-bin/wget"
+chmod +x "$PKI_DIR/wget-bin/wget"
+for http_client in curl wget; do
+    command -v "$http_client" >/dev/null || continue
+    client_runner=()
+    client_path="$PKI_DIR/retry-bin:$PATH"
+    if [[ "$http_client" == wget ]]; then
+        client_runner=(without_curl)
+        client_path="$PKI_DIR/retry-bin:$PKI_DIR/wget-bin:$PATH"
+    fi
+    for status in 404 429 503; do
+        : > "$CHECKCRT_TEST_FETCH_LOG"
+        : > "$CHECKCRT_TEST_SLEEP_LOG"
+        check_exit "$http_client HTTP $status retry classification" 3 \
+            "${client_runner[@]}" env PATH="$client_path" CHECKCRT_TEST_HTTP_STATUS="$status" \
+            "$check" "${cache_args[@]}" --no-cache --connect-retries 3 --retry-delay 1 \
+            127.0.0.1 "$GOOD_PORT"
+        expected_fetches=4 expected_delays='1,2,4'
+        [[ "$status" != 404 ]] || { expected_fetches=1; expected_delays=''; }
+        assert_output "$http_client HTTP $status attempt count" fetch_count_is "$expected_fetches"
+        assert_output "$http_client HTTP $status wait sequence" \
+            test "$(paste -sd, "$CHECKCRT_TEST_SLEEP_LOG")" = "$expected_delays"
+    done
+done
+
+if command -v wget >/dev/null; then
+    actual_wget=$(command -v wget)
+    : > "$CHECKCRT_TEST_FETCH_LOG"
+    check_exit "wget fallback downloads and verifies a CRL" 0 \
+        without_curl env PATH="$PKI_DIR/wget-bin:$PATH" CHECKCRT_TEST_FETCH_BIN="$actual_wget" \
+        "$check" "${cache_args[@]}" --no-cache 127.0.0.1 "$GOOD_PORT"
+    assert_output "wget fallback performs one successful request" fetch_count_is 1
+    : > "$CHECKCRT_TEST_FETCH_LOG"
+    check_exit "wget enforces the total request deadline" 3 \
+        without_curl env PATH="$PKI_DIR/wget-bin:$PATH" CHECKCRT_TEST_FETCH_DELAY=3 \
+        CHECKCRT_TEST_WGET_ARGS="$PKI_DIR/wget.args" CHECKCRT_TEST_FETCH_BIN="$actual_wget" \
+        "$check" "${cache_args[@]}" --no-cache --request-timeout 1 --connect-retries 1 \
+        --json 127.0.0.1 "$GOOD_PORT"
+    assert_output "wget timeout uses exactly the configured attempts" fetch_count_is 2
+    assert_output "wget timeout stops before delayed downloads finish" \
+        json_matches '.[0].elapsed_seconds < 6' /tmp/functest.out
+    assert_output "wget has no nested retry loop" grep -Fxq -- '--tries=1' "$PKI_DIR/wget.args"
+    assert_output "wget obeys the connection timeout" grep -Fxq -- '--connect-timeout=2' "$PKI_DIR/wget.args"
+    assert_output "wget uses the request timeout for reads" grep -Fxq -- '--read-timeout=1' "$PKI_DIR/wget.args"
+fi
+
+# One exhausted retry sequence is shared by waiting hosts. The failure marker
+# carries no certificate verdict and never counts as verified cache evidence.
+printf '127.0.0.1 %s\n127.0.0.1 %s\n127.0.0.1 %s\n' \
+    "$GOOD_PORT" "$GOOD_PORT" "$GOOD_PORT" > "$PKI_DIR/hosts-cooldown.txt"
+: > "$CHECKCRT_TEST_FETCH_LOG"
+: > "$CHECKCRT_TEST_SLEEP_LOG"
+check_exit "parallel failed downloads share a cooldown" 1 \
+    env PATH="$PKI_DIR/retry-bin:$PATH" CHECKCRT_TEST_FETCH_FAILURES=99 \
+    "$check" "${cache_args[@]}" --connect-retries 3 --retry-delay 1 \
+    --cache-dir "$PKI_DIR/cooldown-cache" --parallel 3 --hosts-file "$PKI_DIR/hosts-cooldown.txt" --json
+assert_output "three workers share only four failed requests" fetch_count_is 4
+assert_output "cooldown returns UNKNOWN without hits or extra misses" \
+    json_matches 'length == 3 and all(.[]; .overall == "UNKNOWN" and .cache_hits == 0) and ([.[].cache_misses] | add) == 1' /tmp/functest.out
+assert_output "waiting hosts report the cooldown" grep -q 'Cache COOLDOWN (CRL)' /tmp/functest.err
+failure_marker=("$PKI_DIR/cooldown-cache"/*.failed)
+assert_output "failure marker is private" test "$(stat -c %a "${failure_marker[0]}")" = 600
+: > "$CHECKCRT_TEST_FETCH_LOG"
+check_exit "a separate invocation shares the recent failure" 3 \
+    "$check" "${cache_args[@]}" --cache-dir "$PKI_DIR/cooldown-cache" 127.0.0.1 "$GOOD_PORT"
+assert_output "recent shared failure suppresses a new request" fetch_count_is 0
+printf '# checkCRT-failure-v1 %s\n' "$(( $(date -u +%s) - 11 ))" > "${failure_marker[0]}"
+check_exit "expired cooldown permits recovery" 0 \
+    "$check" "${cache_args[@]}" --cache-dir "$PKI_DIR/cooldown-cache" 127.0.0.1 "$GOOD_PORT"
+assert_output "recovery makes exactly one request" fetch_count_is 1
+printf '# checkCRT-failure-v1 %s\n' "$(date -u +%s)" > "${failure_marker[0]}"
+: > "$CHECKCRT_TEST_FETCH_LOG"
+check_exit "verified cached evidence takes priority over a failure marker" 0 \
+    "$check" "${cache_args[@]}" --cache-dir "$PKI_DIR/cooldown-cache" 127.0.0.1 "$GOOD_PORT"
+assert_output "verified evidence needs no request during cooldown" fetch_count_is 0
 
 # Trust can end at the local self-signed root while the server presents a
 # cross-signed copy. Its absent legacy issuer cannot verify its own CRL.
@@ -569,6 +687,8 @@ for period in reversed empty; do
     assert_output "$period cached period cannot supply revocation evidence" \
         json_matches 'length == 1 and .[0].revocation == "UNKNOWN"' /tmp/functest.out
     rm -f "$CHECKCRT_TEST_OFFLINE"
+    # Recovery is a separate scenario after the shared failure window expires.
+    printf '# checkCRT-failure-v1 %s\n' "$(( $(date -u +%s) - 11 ))" > "$cached_crl.failed"
     : > "$CHECKCRT_TEST_FETCH_LOG"
     check_exit "cached CRL with $period update period is refreshed" 0 \
         "$check" "${cache_args[@]}" --cache-dir "$persistent_cache" 127.0.0.1 "$GOOD_PORT"
