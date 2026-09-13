@@ -9,7 +9,7 @@
 
 set -u -o pipefail
 
-VERSION=1.14.1
+VERSION=1.14.2
 verify_peer=1
 ca_file=
 ca_path=
@@ -426,8 +426,13 @@ crl_signature_is_valid() {
     [[ -n "$verifier" ]] || return 1
     # OpenSSL 3.0 can print "verify failure" yet exit 0. Require positive
     # signature evidence as well as success, for fresh and cached CRLs alike.
+    # Some OpenSSL builds add an extra informational line (provider/engine
+    # notices, deprecation banners) around a genuine "verify OK", so check
+    # for that line anywhere in the output instead of requiring an exact
+    # whole-output match, which would reject a validly-signed CRL on those
+    # builds.
     verification=$(LC_ALL=C openssl crl -in "$crl" -noout -verify -CAfile "$verifier" 2>&1) || return 1
-    [[ "$verification" == 'verify OK' ]]
+    grep -Fxq 'verify OK' <<<"$verification"
 }
 
 crl_is_current() {

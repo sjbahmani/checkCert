@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.14.2
+
+- Fix `crl_signature_is_valid()` to accept a `verify OK` line anywhere in
+  `openssl crl -verify`'s output instead of requiring an exact whole-output
+  match, which could reject a validly-signed CRL on OpenSSL builds that add
+  an extra informational line (provider/engine notices, deprecation
+  banners) alongside it.
+
 ## 1.14.1
 
 - Reject invalid CRL signatures on OpenSSL 3.0 as well as 3.5. Require

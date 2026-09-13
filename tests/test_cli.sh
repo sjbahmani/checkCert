@@ -30,7 +30,7 @@ grep -q -- '--cache-max-age' "$scratch/stdout"
 grep -q -- '--cache-max-age .*default: 14400;' "$scratch/stdout"
 grep -q -- '--no-cache' "$scratch/stdout"
 expect_exit 0 "$script" --version
-grep -q '^checkCRT.sh 1\.14\.1$' "$scratch/stdout"
+grep -q '^checkCRT.sh 1\.14\.2$' "$scratch/stdout"
 expect_exit 1 "$script" --connect-timeout 0 example.com
 grep -q 'positive number' "$scratch/stderr"
 expect_exit 1 "$script" --ca-file "$scratch/missing.pem" example.com
