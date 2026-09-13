@@ -9,12 +9,15 @@
 
 set -u -o pipefail
 
-VERSION=1.11.0
+VERSION=1.12.0
 verify_peer=1
 ca_file=
 ca_path=
 output_format=text
 summary_only=0
+connect_ip=
+connect_ip_set=0
+connect_ip_json=null
 connect_timeout=5
 request_timeout=20
 connect_retries=4
@@ -45,6 +48,8 @@ Options:
                       (one object per host, newline-delimited in batch mode).
   --summary-only      Show only FINAL STATUS (single host) or BATCH SUMMARY
                       (hosts file). With --json, suppress diagnostics.
+  --connect-ip IP     Connect to this IPv4/IPv6 address, keeping the original
+                      hostname for SNI and identity checks. Applies to all hosts.
   --connect-timeout N TLS connection timeout in seconds (default: 5).
   --request-timeout N CRL/OCSP request timeout in seconds (default: 20).
   --connect-retries N Retry a failed network operation (initial TLS
@@ -89,11 +94,12 @@ while (( $# > 0 )); do
         --summary-only) summary_only=1 ;;
         --no-caa) check_caa=0 ;;
         --fail-on-expiry-warning) fail_on_expiry_warning=1 ;;
-        --connect-timeout|--request-timeout|--connect-retries|--retry-delay|--max-ocsp-age|--clock-skew|--proxy|--no-proxy|--ca-path|--starttls|--expiry-warn-days|--hosts-file|--parallel)
+        --connect-ip|--connect-timeout|--request-timeout|--connect-retries|--retry-delay|--max-ocsp-age|--clock-skew|--proxy|--no-proxy|--ca-path|--starttls|--expiry-warn-days|--hosts-file|--parallel)
             option_name=$1
             shift
             [[ $# -gt 0 ]] || { echo "Error: $option_name requires a value." >&2; exit 1; }
             case $option_name in
+                --connect-ip) connect_ip=$1; connect_ip_set=1 ;;
                 --connect-timeout) connect_timeout=$1 ;;
                 --request-timeout) request_timeout=$1 ;;
                 --connect-retries) connect_retries=$1 ;;
@@ -116,6 +122,7 @@ while (( $# > 0 )); do
             ;;
         --ca-file=*) ca_file=${1#--ca-file=} ;;
         --ca-path=*) ca_path=${1#--ca-path=} ;;
+        --connect-ip=*) connect_ip=${1#--connect-ip=}; connect_ip_set=1 ;;
         --connect-timeout=*) connect_timeout=${1#--connect-timeout=} ;;
         --request-timeout=*) request_timeout=${1#--request-timeout=} ;;
         --connect-retries=*) connect_retries=${1#--connect-retries=} ;;
@@ -135,6 +142,48 @@ while (( $# > 0 )); do
     shift
 done
 
+is_ipv4_literal() {
+    local address=$1 octet
+    local -a octets=()
+    [[ "$address" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    IFS=. read -r -a octets <<<"$address"
+    for octet in "${octets[@]}"; do
+        # Avoid ambiguous octal spellings such as 012.0.0.1.
+        [[ "$octet" == 0 || "$octet" != 0* ]] || return 1
+        (( 10#$octet <= 255 )) || return 1
+    done
+}
+
+is_ip_literal() {
+    local address=$1 compressed=0
+    local -a groups=()
+    if [[ "$address" != *:* ]]; then is_ipv4_literal "$address"; return $?; fi
+    [[ "$address" =~ ^[[:xdigit:]:.]+$ && "$address" != *:::* ]] || return 1
+    if [[ "$address" == *.* ]]; then
+        # An embedded IPv4 tail occupies the last two IPv6 groups.
+        is_ipv4_literal "${address##*:}" || return 1
+        address="${address%:*}:0:0"
+    fi
+    [[ "$address" != :* || "$address" == ::* ]] || return 1
+    [[ "$address" != *: || "$address" == *:: ]] || return 1
+    if [[ "$address" == *::* ]]; then
+        compressed=1
+        [[ "${address#*::}" != *::* ]] || return 1
+        address=${address/::/:}
+        address=${address#:}
+        address=${address%:}
+    fi
+    if [[ -n "$address" ]]; then
+        [[ "$address" =~ ^([[:xdigit:]]{1,4}:)*[[:xdigit:]]{1,4}$ ]] || return 1
+        IFS=: read -r -a groups <<<"$address"
+    fi
+    if (( compressed == 1 )); then
+        (( ${#groups[@]} < 8 ))
+    else
+        (( ${#groups[@]} == 8 ))
+    fi
+}
+
 domain=
 port=443
 if [[ -n "$hosts_file" ]]; then
@@ -147,6 +196,15 @@ else
     if (( ${#positionals[@]} < 1 || ${#positionals[@]} > 2 )); then usage >&2; exit 1; fi
     domain=${positionals[0]}
     port=${positionals[1]:-443}
+fi
+if (( connect_ip_set == 1 )); then
+    # Brackets are optional around an IPv6 literal; the port stays positional.
+    if [[ "$connect_ip" =~ ^\[([^][]*:[^][]*)\]$ ]]; then connect_ip=${BASH_REMATCH[1]}; fi
+    if ! is_ip_literal "$connect_ip"; then
+        echo "Error: --connect-ip requires an IPv4 or IPv6 address without a port or zone ID." >&2
+        exit 1
+    fi
+    connect_ip_json="\"$connect_ip\""
 fi
 if [[ -n "$ca_file" && ! -r "$ca_file" ]]; then
     echo "Error: CA file is not readable: $ca_file" >&2
@@ -263,6 +321,7 @@ print_final_status() {
     fi
     {
         echo "FINAL STATUS"
+        [[ -n "$connect_ip" ]] && printf '  CONNECT IP: %s\n' "$connect_ip"
         printf '  ISSUER: %s\n' "${1:-unknown}"
         printf '  TRUST: %s\n' "$2"
         printf '  REVOCATION: %s\n' "$3"
@@ -287,8 +346,8 @@ emit_error_json() {
         print_final_status '' UNKNOWN UNKNOWN UNKNOWN '' ERROR "$message"
     fi
     [[ "$output_format" == json ]] || return 0
-    printf '{"host":"%s","port":%s,"issuer":null,"trust":null,"revocation":null,"expiry":null,"expiry_days_left":null,"intermediate_revoked":null,"stapled_ocsp":null,"overall":"ERROR","reason":"%s","exit_code":3,"warnings":[],"error":"%s"}\n' \
-        "$(json_escape "$err_domain")" "$err_port" "$(json_escape "$message")" "$(json_escape "$message")" >&3
+    printf '{"host":"%s","port":%s,"connect_ip":%s,"issuer":null,"trust":null,"revocation":null,"expiry":null,"expiry_days_left":null,"intermediate_revoked":null,"stapled_ocsp":null,"overall":"ERROR","reason":"%s","exit_code":3,"warnings":[],"error":"%s"}\n' \
+        "$(json_escape "$err_domain")" "$err_port" "$connect_ip_json" "$(json_escape "$message")" "$(json_escape "$message")" >&3
 }
 
 fetch() {
@@ -454,7 +513,7 @@ check_host_details() {
         return 3
     fi
 
-    local host_workdir connection_host is_ip sni_args connect_target starttls_args
+    local host_workdir connection_host transport_host is_ip sni_args connect_target starttls_args
     local connect_attempt connect_ok
     local -a warnings=()
     local leaf stapled_ocsp leaf_eku retry_workdir retry_eku status_retry_used=0
@@ -488,16 +547,23 @@ check_host_details() {
     else
         sni_args=(-servername "$connection_host")
     fi
-    if [[ "$connection_host" == *:* ]]; then
-        connect_target="[$connection_host]:$port"
+    # Only the transport destination changes. SNI, identity validation and CAA
+    # continue to use connection_host, derived from the original host argument.
+    transport_host=${connect_ip:-$connection_host}
+    if [[ "$transport_host" == *:* ]]; then
+        connect_target="[$transport_host]:$port"
     else
-        connect_target="$connection_host:$port"
+        connect_target="$transport_host:$port"
     fi
 
     starttls_args=()
     [[ -n "$starttls_proto" ]] && starttls_args=(-starttls "$starttls_proto")
+    if [[ -n "$connect_ip" && ( "$starttls_proto" == xmpp || "$starttls_proto" == xmpp-server ) ]]; then
+        starttls_args+=(-xmpphost "$connection_host")
+    fi
 
     echo "Fetching TLS certificate from ${domain}:${port} ...${starttls_proto:+ (STARTTLS: $starttls_proto)}"
+    [[ -n "$connect_ip" ]] && echo "Connection target: $connect_target (identity: $connection_host)"
     connect_attempt=0
     connect_ok=0
     while :; do
@@ -1071,8 +1137,8 @@ check_host_details() {
             warnings_json+="\"$(json_escape "${warnings[$index]}")\""
         done
         warnings_json+=']'
-        printf '{"host":"%s","port":%s,"issuer":"%s","trust":"%s","revocation":"%s","expiry":"%s","expiry_days_left":%s,"intermediate_revoked":%s,"stapled_ocsp":"%s","overall":"%s","reason":"%s","exit_code":%s,"warnings":%s}\n' \
-            "$(json_escape "$domain")" "$port" "$(json_escape "$issuer_cn")" "$(json_escape "$trust_status")" \
+        printf '{"host":"%s","port":%s,"connect_ip":%s,"issuer":"%s","trust":"%s","revocation":"%s","expiry":"%s","expiry_days_left":%s,"intermediate_revoked":%s,"stapled_ocsp":"%s","overall":"%s","reason":"%s","exit_code":%s,"warnings":%s}\n' \
+            "$(json_escape "$domain")" "$port" "$connect_ip_json" "$(json_escape "$issuer_cn")" "$(json_escape "$trust_status")" \
             "$(json_escape "$revocation_status")" "$(json_escape "$expiry_status")" \
             "${expiry_days_left:-null}" \
             "$(if (( intermediate_revoked == 1 )); then echo true; else echo false; fi)" \
@@ -1252,6 +1318,7 @@ if [[ -n "$hosts_file" ]]; then
 
         echo
         echo "BATCH SUMMARY (${batch_total} host(s) checked)"
+        [[ -n "$connect_ip" ]] && printf '  CONNECT IP: %s\n' "$connect_ip"
         echo
         printf '  %-*s  %-*s  %-*s  %*s  %s\n' \
             "$batch_status_w" STATUS "$batch_host_w" HOST "$batch_issuer_w" ISSUER "$batch_days_w" "DAYS LEFT" REASON

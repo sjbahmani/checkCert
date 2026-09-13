@@ -27,6 +27,8 @@ REVOKED_PORT=8992
 LEAF3_PORT=8993
 AIA_PORT=8994
 OCSP_PURPOSE_PORT=8995
+SNI_PORT=8996
+IPV6_PORT=8997
 
 export HTTPPORT
 PKI_DIR=$(bash "$script_dir/setup_pki.sh")
@@ -40,10 +42,11 @@ cleanup() {
 trap cleanup EXIT
 
 start_server() {
-    local port=$1 cert=$2 chain=${3:-}
+    local port=$1 cert=$2 chain=${3:-} bind_host=${4:-127.0.0.1}
     local key="${cert/\/certs\//\/private\/}"
     key="${key%.pem}.key"
-    local -a args=(-accept "127.0.0.1:$port" -cert "$cert" -key "$key" -naccept 20 -quiet)
+    [[ "$bind_host" == *:* ]] && bind_host="[$bind_host]"
+    local -a args=(-accept "$bind_host:$port" -cert "$cert" -key "$key" -naccept 40 -quiet)
     [[ -n "$chain" ]] && args+=(-cert_chain "$chain")
     openssl s_server "${args[@]}" >"$PKI_DIR/s_server-$port.log" 2>&1 &
     pids+=($!)
@@ -63,13 +66,24 @@ start_server "$AIA_PORT" "$PKI_DIR/certs/leaf-good.pem"
 # leaf-ocsp-purpose: wrong EKU (no serverAuth), exercises the -status retry
 start_server "$OCSP_PURPOSE_PORT" "$PKI_DIR/certs/leaf-ocsp-purpose.pem" "$PKI_DIR/chain-good.pem"
 
+# Only SNI=backend.test selects the good leaf; no/wrong SNI gets the revoked
+# leaf. This verifies the actual ClientHello, not just command-line arguments.
+openssl s_server -accept "127.0.0.1:$SNI_PORT" -quiet -naccept 20 \
+    -cert "$PKI_DIR/certs/leaf-revoked.pem" -key "$PKI_DIR/private/leaf-revoked.key" \
+    -cert2 "$PKI_DIR/certs/leaf-good.pem" -key2 "$PKI_DIR/private/leaf-good.key" \
+    -cert_chain "$PKI_DIR/chain-good.pem" -servername backend.test >"$PKI_DIR/s_server-$SNI_PORT.log" 2>&1 &
+pids+=("$!")
+start_server "$IPV6_PORT" "$PKI_DIR/certs/leaf-good.pem" "$PKI_DIR/chain-good.pem" ::1
+
 sleep 1
-for p in "$HTTPPORT" "$GOOD_PORT" "$REVOKED_PORT" "$LEAF3_PORT" "$AIA_PORT" "$OCSP_PURPOSE_PORT"; do
+for p in "$HTTPPORT" "$GOOD_PORT" "$REVOKED_PORT" "$LEAF3_PORT" "$AIA_PORT" "$OCSP_PURPOSE_PORT" "$SNI_PORT"; do
     timeout 3 bash -c "echo > /dev/tcp/127.0.0.1/$p" 2>/dev/null || {
         echo "FAIL: server on port $p did not come up" >&2
         exit 1
     }
 done
+ipv6_available=0
+if timeout 3 bash -c "echo > /dev/tcp/::1/$IPV6_PORT" 2>/dev/null; then ipv6_available=1; fi
 
 pass=0
 fail=0
@@ -247,6 +261,62 @@ assert_output "JSON error record remains parseable and includes the reason" \
             and (.error | type == "string" and length > 0))
     ' /tmp/functest.out
 assert_output "JSON connection error summary suppresses diagnostics" test ! -s /tmp/functest.err
+
+# backend.test has no public DNS record. These requests must use the override,
+# while the certificate and SNI checks must still use backend.test.
+check_exit "--connect-ip preserves SNI and hostname identity" 0 \
+    "$check" --connect-ip 127.0.0.1 --json --summary-only --no-caa \
+    --ca-file "$PKI_DIR/certs/root.pem" backend.test "$SNI_PORT"
+assert_output "JSON identifies the original hostname and backend separately" \
+    json_matches 'length == 1 and (.[0] | .host == "backend.test"
+        and .connect_ip == "127.0.0.1" and .trust == "TRUSTED"
+        and .revocation == "NOT REVOKED" and .overall == "VALID")' /tmp/functest.out
+
+check_exit "--connect-ip does not bypass a hostname mismatch" 5 \
+    "$check" --connect-ip=127.0.0.1 --json --summary-only --no-caa \
+    --ca-file "$PKI_DIR/certs/root.pem" wrong-name.test "$GOOD_PORT"
+assert_output "hostname mismatch refers to the requested name" \
+    json_matches 'length == 1 and (.[0] | .host == "wrong-name.test"
+        and .connect_ip == "127.0.0.1" and .trust == "UNTRUSTED/INVALID"
+        and (.reason | contains("wrong-name.test")))' /tmp/functest.out
+
+check_exit "--connect-ip keeps IP identity checks tied to the original IP" 5 \
+    "$check" --connect-ip 127.0.0.1 --summary-only --no-caa \
+    --ca-file "$PKI_DIR/certs/root.pem" 127.0.0.2 "$GOOD_PORT"
+assert_output "text summary shows the overridden address" \
+    grep -qx '  CONNECT IP: 127.0.0.1' /tmp/functest.out
+assert_output "text summary explains the original IP mismatch" \
+    grep -q '  REASON: .*127.0.0.2' /tmp/functest.out
+
+printf 'backend.test %s\nwrong-name.test %s\n' "$GOOD_PORT" "$GOOD_PORT" > "$PKI_DIR/hosts-backend.txt"
+for parallel in 1 3; do
+    check_exit "--connect-ip: batch identity is preserved ($parallel workers)" 1 \
+        "$check" --connect-ip 127.0.0.1 --json --summary-only --no-caa --parallel "$parallel" \
+        --ca-file "$PKI_DIR/certs/root.pem" --hosts-file "$PKI_DIR/hosts-backend.txt"
+    assert_output "batch records retain each requested hostname ($parallel workers)" \
+        json_matches 'length == 2 and all(.[]; .connect_ip == "127.0.0.1")
+            and (map([.host, .exit_code]) | sort == [["backend.test", 0], ["wrong-name.test", 5]])' /tmp/functest.out
+done
+
+check_exit "--connect-ip: connection errors identify the backend" 3 \
+    "$check" --connect-ip 127.0.0.1 --json --summary-only --no-caa \
+    --connect-timeout 1 --connect-retries 0 backend.test "$HTTPPORT"
+assert_output "JSON connection error retains the original hostname and override" \
+    json_matches 'length == 1 and (.[0] | .host == "backend.test"
+        and .connect_ip == "127.0.0.1" and .overall == "ERROR" and .exit_code == 3)' /tmp/functest.out
+
+if (( ipv6_available == 1 )); then
+    for ipv6_address in '::1' '[::1]'; do
+        check_exit "--connect-ip $ipv6_address: IPv6 backend with DNS identity" 0 \
+            "$check" --connect-ip "$ipv6_address" --json --summary-only --no-caa \
+            --ca-file "$PKI_DIR/certs/root.pem" backend.test "$IPV6_PORT"
+        assert_output "IPv6 override is reported without brackets" \
+            json_matches 'length == 1 and (.[0] | .host == "backend.test"
+                and .connect_ip == "::1" and .overall == "VALID")' /tmp/functest.out
+    done
+else
+    echo 'SKIP: IPv6 backend checks (IPv6 loopback unavailable).'
+fi
 
 echo
 echo "Functional tests: $pass passed, $fail failed."

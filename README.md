@@ -29,6 +29,7 @@ lookup is skipped, not fatal, when none are installed.
 ./checkCRT.sh --hosts-file hosts.txt
 ./checkCRT.sh --summary-only example.com
 ./checkCRT.sh --summary-only --hosts-file hosts.txt
+./checkCRT.sh --connect-ip 192.0.2.10 example.com
 ```
 
 The script always validates the chain and the supplied hostname (or IP address)
@@ -57,7 +58,7 @@ government sites, plus `google.com` as a non-Iranian baseline:
 messages are written to standard error. This makes it suitable for monitoring:
 
 ```json
-{"host":"example.com","port":443,"issuer":"CN=WE2,O=Google Trust Services,C=US","trust":"TRUSTED","revocation":"NOT REVOKED","expiry":"NOT EXPIRED","expiry_days_left":46,"intermediate_revoked":false,"stapled_ocsp":"NOT STAPLED","overall":"VALID","exit_code":0,"warnings":[]}
+{"host":"example.com","port":443,"connect_ip":null,"issuer":"CN=WE2,O=Google Trust Services,C=US","trust":"TRUSTED","revocation":"NOT REVOKED","expiry":"NOT EXPIRED","expiry_days_left":46,"intermediate_revoked":false,"stapled_ocsp":"NOT STAPLED","overall":"VALID","exit_code":0,"warnings":[]}
 ```
 
 Use `--summary-only` to hide certificate details, the CA tree, progress, and
@@ -73,6 +74,35 @@ and startup errors are still reported. If a single-host check cannot complete,
 the text summary reports `OVERALL: ERROR`, `UNKNOWN` check statuses, and the
 failure reason (exit 3).
 
+## Check a specific backend
+
+Use `--connect-ip IP` to connect directly to a backend before changing DNS,
+or to inspect individual servers behind a load balancer:
+
+```bash
+./checkCRT.sh --connect-ip 192.0.2.10 example.com 8443
+./checkCRT.sh --connect-ip=2001:db8::10 example.com
+./checkCRT.sh --summary-only --connect-ip '[2001:db8::10]' example.com
+```
+
+The positional host remains the certificate identity: a hostname is sent as
+SNI and checked against the certificate; a positional IP is still verified as
+an IP. Only the TLS connection address changes. CAA queries use the original
+hostname, and AIA/CRL/OCSP requests still use their certificate URLs. Retries
+and `--starttls` use the same backend; XMPP STARTTLS also retains the original
+host in the stream's `to` attribute.
+
+The override accepts an IPv4 or IPv6 literal (optionally bracketed for IPv6).
+Hostnames, URLs, CIDR prefixes, zone IDs, and an appended port are not accepted;
+specify the port as the second positional argument. Invalid values exit `1`.
+
+In batch mode, the same override applies to **every host** in the hosts file,
+using each entry's own port and certificate identity. Text reports show
+`CONNECT IP` when an override is set, including `--summary-only` reports.
+JSON/NDJSON keeps the original `host` and adds `connect_ip`, containing the
+override without brackets or `null` when no override was supplied. This field
+is also included in connection-error records; it is not a DNS-resolved address.
+
 ## Batch mode
 
 `--hosts-file FILE` checks every host in `FILE` instead of a single
@@ -86,7 +116,7 @@ internal.example 8443
 mail.example.com 587
 ```
 
-Every other option (`--ca-file`, `--starttls`, timeouts, `--expiry-warn-days`,
+Every other option (`--ca-file`, `--connect-ip`, `--starttls`, timeouts, `--expiry-warn-days`,
 ...) applies to every host in the file — there is no per-host override. In
 `--json` mode each host writes one JSON object, so standard output becomes
 newline-delimited JSON (NDJSON), not a single array. The process exit code is
@@ -299,7 +329,9 @@ three leaves (see `tests/functional/setup_pki.sh`), serves them over local
 `openssl s_server`/`busybox httpd` instances on 127.0.0.1, and asserts
 `checkCRT.sh`'s exit code and output for: a valid chain, a revoked leaf, a
 revoked intermediate (with an otherwise-fine leaf), a server that omits its
-intermediate (regression test for AIA-based chain recovery), and
-`--hosts-file` batch mode. It binds local TCP ports, so it needs permission
+intermediate (regression test for AIA-based chain recovery), `--connect-ip`
+with hostname/SNI preservation and mismatch rejection, and `--hosts-file`
+batch mode. IPv6 connections are tested when loopback IPv6 is available.
+It binds local TCP ports, so it needs permission
 to do so in restricted/sandboxed environments; it makes no real network
 requests.

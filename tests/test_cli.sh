@@ -24,8 +24,9 @@ expect_exit() {
 expect_exit 0 "$script" --help
 grep -q -- '--json' "$scratch/stdout"
 grep -q -- '--summary-only' "$scratch/stdout"
+grep -q -- '--connect-ip' "$scratch/stdout"
 expect_exit 0 "$script" --version
-grep -q '^checkCRT.sh 1\.11\.0$' "$scratch/stdout"
+grep -q '^checkCRT.sh 1\.12\.0$' "$scratch/stdout"
 expect_exit 1 "$script" --connect-timeout 0 example.com
 grep -q 'positive number' "$scratch/stderr"
 expect_exit 1 "$script" --ca-file "$scratch/missing.pem" example.com
@@ -43,5 +44,22 @@ expect_exit 1 "$script" --parallel not-a-number example.com
 grep -q 'positive integer' "$scratch/stderr"
 expect_exit 1 "$script" --summary-only --connect-timeout 0 example.com
 grep -q 'positive number' "$scratch/stderr"
+
+expect_exit 1 "$script" --connect-ip
+grep -q -- '--connect-ip requires a value' "$scratch/stderr"
+for invalid_ip in '' backend.test https://127.0.0.1 127.0.0.1:443 127.0.0.1/24 \
+    256.1.1.1 127.1 01.2.3.4 '[127.0.0.1]' ':::' '1::2::3' ':1::' '::1:' \
+    '1:2:3:4:5:6:7' '1:2:3:4:5:6:7:8:9' '1:2:3:4:5:6:7:8::' \
+    '12345::1' 'gggg::1' 'fe80::1%eth0' '[::1]:443' '::ffff:999.1.1.1'; do
+    expect_exit 1 "$script" "--connect-ip=$invalid_ip" backend.test
+    grep -q -- '--connect-ip requires an IPv4 or IPv6 address' "$scratch/stderr"
+done
+# A missing CA file stops before networking, after IP validation succeeds.
+for valid_ip in 127.0.0.1 0.0.0.0 255.255.255.255 '::' '::1' '[::1]' \
+    '2001:db8::' '2001:db8:0:1:2:3:4:5' '1:2:3:4:5:6:7::' \
+    '::ffff:192.0.2.1' '0:0:0:0:0:ffff:192.0.2.1'; do
+    expect_exit 1 "$script" --connect-ip "$valid_ip" --ca-file "$scratch/missing.pem" backend.test
+    grep -q 'CA file is not readable' "$scratch/stderr"
+done
 
 echo 'CLI regression tests passed.'

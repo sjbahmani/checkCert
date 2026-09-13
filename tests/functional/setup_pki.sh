@@ -69,7 +69,7 @@ cat > leaf_ext.cnf <<EOF
 basicConstraints=critical,CA:false
 keyUsage=critical,digitalSignature,keyEncipherment
 extendedKeyUsage=serverAuth
-subjectAltName=IP:127.0.0.1
+subjectAltName=IP:127.0.0.1,DNS:backend.test
 crlDistributionPoints=URI:http://127.0.0.1:${HTTPPORT}/intermediate.crl
 authorityInfoAccess=caIssuers;URI:http://127.0.0.1:${HTTPPORT}/intermediate.crt
 authorityKeyIdentifier=keyid:always

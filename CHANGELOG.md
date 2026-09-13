@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.12.0
+
+- Added `--connect-ip IP` to connect to an IPv4/IPv6 backend while keeping
+  the original hostname for SNI, certificate identity checks, and CAA queries.
+  Supports batch mode, STARTTLS, retries, JSON, and summary-only output.
+- Reports identify the override as `CONNECT IP`; JSON records include
+  `connect_ip` (or `null` when omitted), including connection errors.
+- Added backend/SNI, hostname and IP mismatch, IPv6, and input-validation
+  regression coverage using local certificates and `jq`.
+
 ## 1.11.0
 
 - Added `--summary-only`: show just `FINAL STATUS` for a single host or
