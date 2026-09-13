@@ -551,4 +551,5 @@ assert_output "busy lock is not also logged as a normal miss" \
 
 echo
 echo "Functional tests: $pass passed, $fail failed."
-(( fail == 0 ))
+(( fail == 0 )) || exit 1
+bash "$script_dir/ocsp_cache.sh"

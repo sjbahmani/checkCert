@@ -9,7 +9,7 @@
 
 set -u -o pipefail
 
-VERSION=1.13.2
+VERSION=1.14.0
 verify_peer=1
 ca_file=
 ca_path=
@@ -54,11 +54,11 @@ Options:
                       (hosts file). With --json, suppress diagnostics.
   --connect-ip IP     Connect to this IPv4/IPv6 address, keeping the original
                       hostname for SNI and identity checks. Applies to all hosts.
-  --cache-dir DIR     Keep verified CRL/AIA downloads between runs in a private
+  --cache-dir DIR     Keep verified CRL/AIA/OCSP data between runs in a private
                       directory. By default, the cache lasts only this run.
   --cache-max-age N   Maximum cached download age in seconds (default: 14400;
                       4 hours).
-                      CRLs are never reused past nextUpdate.
+                      CRL/OCSP entries are never reused past nextUpdate.
   --no-cache          Disable cache reads and writes, including --cache-dir.
   --connect-timeout N TLS connection timeout in seconds (default: 5).
   --request-timeout N CRL/OCSP request timeout in seconds (default: 20).
@@ -280,7 +280,7 @@ if (( cache_enabled == 1 && cache_dir_set == 1 )); then
         exit 1
     fi
 fi
-for command in openssl awk sed grep mktemp timeout tr sort date; do
+for command in openssl awk sed grep mktemp timeout tr sort date tail; do
     command -v "$command" >/dev/null 2>&1 || {
         echo "Error: '$command' is required." >&2; exit 3;
     }
@@ -435,9 +435,13 @@ crl_is_current() {
 # Cache entries are evidence, never trust anchors or cached verdicts. Validate
 # each object against this host's actual issuer/leaf, even on a cache hit.
 cache_object_is_valid() {
-    local kind=$1 object=$2 verifier=$3 next_update next_epoch
+    local kind=$1 object=$2 verifier=$3 cert=${4:-} report=${5:-} next_update next_epoch
     if [[ "$kind" == aia ]]; then
         is_issuer_of_leaf "$object"
+    elif [[ "$kind" == ocsp ]]; then
+        ocsp_verify_response "$object" "$cert" "$verifier" "$report" || return 1
+        # Unknown responses are reported, but not retained as reusable evidence.
+        grep -Fxq -- "$cert: good" "$report" || grep -Fxq -- "$cert: revoked" "$report"
     else
         [[ -n "$verifier" ]] || return 1
         openssl crl -in "$object" -noout -verify -CAfile "$verifier" >/dev/null 2>&1 || return 1
@@ -450,45 +454,63 @@ cache_object_is_valid() {
 }
 
 cache_read() {
-    local kind=$1 entry=$2 destination=$3 verifier=$4 header fetched_at now
+    local kind=$1 entry=$2 destination=$3 verifier=$4 cert=${5:-} report=${6:-}
+    local header fetched_at now snapshot=$3
+    [[ "$kind" == ocsp ]] && snapshot="$destination.snapshot"
     [[ -f "$entry" && ! -L "$entry" ]] || return 1
-    # Snapshot a single, atomically-published file: metadata and PEM cannot
+    # Snapshot a single, atomically-published file: metadata and payload cannot
     # come from different downloads during parallel checks.
-    cp -- "$entry" "$destination" 2>/dev/null || return 1
-    IFS= read -r header < "$destination" || return 1
+    cp -- "$entry" "$snapshot" 2>/dev/null || return 1
+    IFS= read -r header < "$snapshot" || return 1
     [[ "$header" =~ ^'# checkCRT-cache-v1 '([0-9]{1,12})$ ]] || return 1
     fetched_at=$((10#${BASH_REMATCH[1]}))
     now=$(date -u +%s)
     (( fetched_at <= now && now - fetched_at < cache_max_age )) || return 1
-    cache_object_is_valid "$kind" "$destination" "$verifier" || return 1
+    if [[ "$kind" == ocsp ]]; then
+        # DER is binary: keep it out of Bash variables. The cache envelope is
+        # one timestamp line followed by base64-encoded, signed response bytes.
+        tail -n +2 "$snapshot" | openssl base64 -d -out "$destination" 2>/dev/null || return 1
+    fi
+    cache_object_is_valid "$kind" "$destination" "$verifier" "$cert" "$report" || return 1
     printf '  Cache HIT (%s): USED verified cached download (age: %ss)\n' "${kind^^}" "$((now - fetched_at))"
 }
 
-# Normalize DER/PEM downloads to PEM. A short, per-URL mkdir lock coalesces
+# Normalize CRL/AIA downloads to PEM and retain signed OCSP responses as DER.
+# A short, per-request mkdir lock coalesces
 # parallel downloads without flock or a persistent lock daemon. An abandoned
 # lock costs at most five seconds, then we fetch without caching; it cannot
 # make us accept old evidence. Subshell-scoped cleanup never affects a host's
 # or the parent process's EXIT trap.
 fetch_cached_object() (
-    local kind=$1 url=$2 destination=$3 verifier=${4:-}
+    local kind=$1 url=$2 destination=$3 verifier=${4:-} cert=${5:-} report=${6:-}
     local key entry='' lock_dir='' lock_held=0 cache_temp=''
     local lock_deadline=$((SECONDS + 5))
-    local decoder fetched_at
+    local decoder fetched_at cert_fp issuer_fp
     trap '[[ -z "$cache_temp" ]] || rm -f -- "$cache_temp"; if (( lock_held == 1 )); then rmdir -- "$lock_dir" 2>/dev/null || true; fi' EXIT
     if (( cache_enabled == 1 )); then
-        key=$(printf '%s\n%s' "$kind" "$url" | openssl dgst -sha256 | awk '{print $NF}')
+        if [[ "$kind" == ocsp ]]; then
+            # A responder serves many certificates. Never reuse a response
+            # based only on its URL, issuer name, or certificate serial number.
+            if cert_fp=$(openssl x509 -in "$cert" -noout -fingerprint -sha256) \
+                && issuer_fp=$(openssl x509 -in "$verifier" -noout -fingerprint -sha256); then
+                key=$(printf 'ocsp\n%s\n%s\n%s' "$url" "$cert_fp" "$issuer_fp" | openssl dgst -sha256 | awk '{print $NF}')
+            else key=; fi
+        else
+            key=$(printf '%s\n%s' "$kind" "$url" | openssl dgst -sha256 | awk '{print $NF}')
+        fi
         if [[ "$key" =~ ^[[:xdigit:]]{64}$ ]]; then
             entry="$cache_dir/v1-$kind-$key.pem"
+            [[ "$kind" == ocsp ]] && entry="$cache_dir/v1-ocsp-$key.ocsp"
             lock_dir="$entry.lock"
-            if cache_read "$kind" "$entry" "$destination" "$verifier"; then exit 0; fi
+            if cache_read "$kind" "$entry" "$destination" "$verifier" "$cert" "$report"; then exit 0; fi
             while :; do
                 if (umask 077; mkdir -- "$lock_dir") 2>/dev/null; then
                     lock_held=1
                     # Another worker may have published after our first read.
-                    if cache_read "$kind" "$entry" "$destination" "$verifier"; then exit 0; fi
+                    if cache_read "$kind" "$entry" "$destination" "$verifier" "$cert" "$report"; then exit 0; fi
                     break
                 fi
-                if cache_read "$kind" "$entry" "$destination" "$verifier"; then exit 0; fi
+                if cache_read "$kind" "$entry" "$destination" "$verifier" "$cert" "$report"; then exit 0; fi
                 # A missing lock here can mean its owner just published and
                 # released it, not a cache failure. Retry the read/acquisition.
                 if [[ ! -d "$cache_dir" || ! -w "$cache_dir" || -L "$lock_dir" ]] || (( SECONDS >= lock_deadline )); then
@@ -507,18 +529,23 @@ fetch_cached_object() (
         printf '  Cache BYPASS (%s): NOT USED; disabled by --no-cache, downloading\n' "${kind^^}"
     fi
     fetched_at=$(date -u +%s)
-    if ! fetch "$url" "$destination.download"; then exit 1; fi
-    decoder=crl
-    [[ "$kind" == aia ]] && decoder=x509
-    if openssl "$decoder" -inform DER -in "$destination.download" -out "$destination" >/dev/null 2>&1; then :
-    elif openssl "$decoder" -inform PEM -in "$destination.download" -out "$destination" >/dev/null 2>&1; then :
+    if [[ "$kind" == ocsp ]]; then
+        if ! fetch_ocsp_response "$url" "$destination" "$cert" "$verifier" "$report"; then exit 1; fi
     else
-        echo "  Result: downloaded file is not a readable ${kind^^} object" >&2
-        exit 1
+        if ! fetch "$url" "$destination.download"; then exit 1; fi
+        decoder=crl
+        [[ "$kind" == aia ]] && decoder=x509
+        if openssl "$decoder" -inform DER -in "$destination.download" -out "$destination" >/dev/null 2>&1; then :
+        elif openssl "$decoder" -inform PEM -in "$destination.download" -out "$destination" >/dev/null 2>&1; then :
+        else
+            echo "  Result: downloaded file is not a readable ${kind^^} object" >&2
+            exit 1
+        fi
     fi
-    if (( lock_held == 1 )) && cache_object_is_valid "$kind" "$destination" "$verifier"; then
+    if (( lock_held == 1 )) && cache_object_is_valid "$kind" "$destination" "$verifier" "$cert" "$report"; then
         if cache_temp=$(mktemp "$cache_dir/.checkcrt-cache.XXXXXX") \
-            && { printf '# checkCRT-cache-v1 %s\n' "$fetched_at"; cat "$destination"; } > "$cache_temp" \
+            && { printf '# checkCRT-cache-v1 %s\n' "$fetched_at";
+                 if [[ "$kind" == ocsp ]]; then openssl base64 -in "$destination"; else cat "$destination"; fi; } > "$cache_temp" \
             && mv -fT -- "$cache_temp" "$entry"; then
             cache_temp=
         else
@@ -529,6 +556,54 @@ fetch_cached_object() (
     # an invalid newly-downloaded object is never written to the cache.
     exit 0
 )
+
+# Use the summary for the requested CertID only (not every SingleResponse in
+# -resp_text). OpenSSL can print a status-time warning yet exit successfully;
+# explicitly enforce freshness rather than treating exit 0 as a valid status.
+ocsp_report_is_current() {
+    local report=$1 cert=$2 this_update next_update this_epoch next_epoch now
+    grep -Fxq -- "$cert: good" "$report" || grep -Fxq -- "$cert: revoked" "$report" \
+        || grep -Fxq -- "$cert: unknown" "$report" || return 1
+    this_update=$(sed -n 's/^[[:space:]]*This Update: *//p' "$report")
+    next_update=$(sed -n 's/^[[:space:]]*Next Update: *//p' "$report")
+    [[ -n "$this_update" && "$this_update" != *$'\n'* && "$next_update" != *$'\n'* ]] || return 1
+    this_epoch=$(date -u -d "$this_update" +%s 2>/dev/null) || return 1
+    now=$(date -u +%s)
+    (( this_epoch <= now + clock_skew && now - this_epoch <= max_ocsp_age )) || return 1
+    if [[ -n "$next_update" ]]; then
+        next_epoch=$(date -u -d "$next_update" +%s 2>/dev/null) || return 1
+        # No clock-skew extension beyond nextUpdate, even for a fresh download.
+        (( next_epoch > now && next_epoch >= this_epoch )) || return 1
+    fi
+}
+
+ocsp_verify_response() {
+    local response=$1 cert=$2 verifier=$3 report=$4
+    if ! timeout "$request_timeout" openssl ocsp -respin "$response" -issuer "$verifier" -cert "$cert" \
+        -no_nonce -CAfile "$verifier" -partial_chain -validity_period "$clock_skew" \
+        -status_age "$max_ocsp_age" > "$report" 2>&1; then return 1; fi
+    if ! ocsp_report_is_current "$report" "$cert"; then
+        echo 'OCSP response has no matching usable status, is stale, or has invalid update times.' >> "$report"
+        return 1
+    fi
+}
+
+fetch_ocsp_response() {
+    local url=$1 response=$2 cert=$3 verifier=$4 report=$5 attempt=0
+    local -a ocsp_proxy_args=()
+    [[ -n "$proxy" ]] && ocsp_proxy_args+=(-proxy "$proxy")
+    [[ -n "$no_proxy" ]] && ocsp_proxy_args+=(-no_proxy "$no_proxy")
+    while :; do
+        : > "$response"
+        if timeout "$request_timeout" openssl ocsp -issuer "$verifier" -cert "$cert" -url "$url" \
+            -no_nonce -CAfile "$verifier" -partial_chain -validity_period "$clock_skew" \
+            -status_age "$max_ocsp_age" -respout "$response" "${ocsp_proxy_args[@]}" > "$report" 2>&1 \
+            && ocsp_verify_response "$response" "$cert" "$verifier" "$report"; then return 0; fi
+        (( attempt >= connect_retries )) && return 1
+        attempt=$((attempt + 1))
+        (( retry_delay > 0 )) && sleep "$retry_delay"
+    done
+}
 
 crl_has_serial_for() {
     # Comparing the extracted value avoids prefix matches (e.g. AB vs ABC).
@@ -560,7 +635,7 @@ check_certificate_revocation() {
     local cert=$1 label=$2 verifier=$3
     local cert_serial local_crl_urls idx url crl_pem
     local checked_local=0 revoked_local=0 ocsp_good_local=0
-    local ocsp_url_local ocsp_output ocsp_rc ocsp_proxy_args ocsp_attempt
+    local ocsp_url_local ocsp_output ocsp_rc ocsp_response ocsp_report
 
     cert_serial=$(openssl x509 -in "$cert" -noout -serial | sed 's/^serial=//' | tr -d ':' | tr '[:lower:]' '[:upper:]')
     mapfile -t local_crl_urls < <(
@@ -606,28 +681,19 @@ check_certificate_revocation() {
         if [[ -z "$verifier" ]]; then
             echo "  Result: issuer certificate unavailable; OCSP response cannot be verified" >&2
         else
-            ocsp_proxy_args=()
-            [[ -n "$proxy" ]] && ocsp_proxy_args+=(-proxy "$proxy")
-            [[ -n "$no_proxy" ]] && ocsp_proxy_args+=(-no_proxy "$no_proxy")
-            ocsp_attempt=0
-            while :; do
-                ocsp_output=$(timeout "$request_timeout" openssl ocsp -issuer "$verifier" -cert "$cert" -url "$ocsp_url_local" \
-                    -no_nonce -CAfile "$verifier" -partial_chain -validity_period "$clock_skew" \
-                    -status_age "$max_ocsp_age" "${ocsp_proxy_args[@]}" 2>&1)
-                ocsp_rc=$?
-                (( ocsp_rc == 0 )) && break
-                (( ocsp_attempt >= connect_retries )) && break
-                ocsp_attempt=$((ocsp_attempt + 1))
-                (( retry_delay > 0 )) && sleep "$retry_delay"
-            done
+            ocsp_response="$host_workdir/ocsp-$$-$RANDOM.der"
+            ocsp_report="$ocsp_response.txt"
+            fetch_cached_object ocsp "$ocsp_url_local" "$ocsp_response" "$verifier" "$cert" "$ocsp_report"
+            ocsp_rc=$?
+            ocsp_output=$(cat "$ocsp_report" 2>/dev/null)
             if (( ocsp_rc != 0 )); then
                 echo "  Result: OCSP query or response verification failed" >&2
                 printf '%s\n' "$ocsp_output" | sed 's/^/    /' >&2
-            elif printf '%s\n' "$ocsp_output" | grep -qi ': revoked'; then
+            elif grep -Fxq -- "$cert: revoked" "$ocsp_report"; then
                 printf '%s\n' "$ocsp_output" | grep -Ei ': revoked|This Update|Next Update|Revocation Time' | sed 's/^/  /'
                 echo "  Result: REVOKED"
                 revoked_local=1
-            elif printf '%s\n' "$ocsp_output" | grep -qi ': good'; then
+            elif grep -Fxq -- "$cert: good" "$ocsp_report"; then
                 printf '%s\n' "$ocsp_output" | grep -Ei ': good|This Update|Next Update' | sed 's/^/  /'
                 echo "  Result: good (verified OCSP response)"
                 ocsp_good_local=1

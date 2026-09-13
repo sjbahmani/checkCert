@@ -33,7 +33,10 @@ errors — CI fails on warnings too).
   fallback, and `--hosts-file` batch mode (both sequential and parallel),
   asserting exit codes and specific output. Cache tests count actual CRL/AIA
   downloads through `fetch_wrapper.sh` and exercise freshness, signature
-  verification, outages, and parallel reuse. It makes no real network
+  verification, outages, and parallel reuse. The entry point also runs
+  `ocsp_cache.sh`, which can be run independently with Bash and uses a local
+  CGI responder to test signed OCSP responses and count actual HTTP requests.
+  It makes no real network
   requests, but it does bind local TCP ports, so in a sandboxed environment
   you may need to grant permission for that.
 

@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.14.0
+
+- Cache verified OCSP responses alongside CRL/AIA data using the existing
+  four-hour default, `--cache-dir`, `--cache-max-age`, and `--no-cache`.
+  Shared intermediate and repeated-leaf checks reuse responses across batch
+  workers; diagnostics explicitly report OCSP cache hits, misses, and bypasses.
+- Cache keys bind the responder URL, certificate, and issuer. Every hit
+  rechecks the signed response and requested certificate status; `unknown`
+  and unverifiable responses are not cached. TLS/identity/trust checks stay live.
+- Enforce `thisUpdate` age and `nextUpdate` limits on both cached and fresh
+  OCSP responses, including when OpenSSL only emits a time warning. Failed
+  refreshes never fall back to stale evidence.
+- Add local signed-OCSP regression tests, including parallel request counts,
+  outages, wrong certificates/signers, time limits, and revoked intermediates.
+  Tests use Bash, OpenSSL, BusyBox, and `jq`; no Python is needed.
+
 ## 1.13.2
 
 - Increase the default CRL/AIA cache lifetime to 14400 seconds (4 hours).

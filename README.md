@@ -8,7 +8,7 @@ distribution points and OCSP.
 
 Linux or another environment with Bash 4.3+ (needed for `wait -n`, used by
 `--hosts-file`'s default parallel mode), OpenSSL, `curl` or `wget`, GNU
-`timeout`, `date`, `awk`, `sed`, `grep`, `sort`, `tr`, and `mktemp`. LDAP CRL
+`timeout`, `date`, `awk`, `sed`, `grep`, `sort`, `tr`, `tail`, and `mktemp`. LDAP CRL
 and AIA issuer URLs are detected and skipped with a clear message, since they
 cannot be fetched by `curl`/`wget` in this script. `dig`, `host`, or
 `nslookup` (any one of them) is required for the CAA record lookup; the
@@ -108,10 +108,10 @@ JSON/NDJSON keeps the original `host` and adds `connect_ip`, containing the
 override without brackets or `null` when no override was supplied. This field
 is also included in connection-error records; it is not a DNS-resolved address.
 
-## CRL and AIA caching
+## CRL, AIA, and OCSP caching
 
-Verified CRL downloads and AIA issuer certificates are shared between hosts
-in the same invocation by default, including parallel batch checks. The
+Verified CRLs, AIA issuer certificates, and OCSP responses are shared between
+hosts in the same invocation by default, including parallel batch checks. The
 temporary cache is removed when the run exits. To reuse downloads across
 runs, choose a persistent directory:
 
@@ -125,7 +125,7 @@ runs, choose a persistent directory:
   It must be owned by you, readable/writable/searchable, not a symlink, and
   not group- or world-writable. New directories and cache entries are private
   (`700` and `600`). Existing directory permissions are never changed.
-- `--cache-max-age N` limits both CRL and AIA download age to
+- `--cache-max-age N` limits CRL, AIA, and OCSP download age to
   **14400 seconds (4 hours)** by default. Accepts positive integer seconds,
   up to 9 digits. Reuse does not reset the download timestamp.
 - `--no-cache` bypasses all cache reads and writes, even when `--cache-dir`
@@ -137,37 +137,59 @@ clock-skew tolerance never extends its cache lifetime. An AIA certificate
 must match the expected issuer and verify the leaf. The normal trust-store,
 identity, expiry, and revocation checks still run: cached issuers are **not**
 added to the trust store, and a CRL is checked separately against every
-certificate's serial number. Neither verdicts nor OCSP responses are cached.
+certificate's serial number. Whole-host verdicts are never cached.
+
+OCSP caching saves the signed response bytes, not just a `good`/`revoked`
+string. Keys include the responder URL and the certificate and issuer
+SHA-256 fingerprints: two certificates sharing a responder cannot borrow
+each other's status. Every hit rechecks the signature, signer authorization,
+and the status for the requested certificate. Both `good` and `revoked`
+responses can be cached; `unknown`, failed, and unverifiable responses cannot.
+
+OCSP reuse is limited by **all** of the following:
+
+- The download-age limit (`--cache-max-age`, default 4 hours).
+- The signed `thisUpdate` age (`--max-ocsp-age`, default 24 hours), whether
+  or not the responder includes `nextUpdate`.
+- The signed `nextUpdate`, when present. Clock skew never extends this limit.
+
+Without `nextUpdate`, both age limits still apply. Missing/unparseable update
+times and `thisUpdate` values beyond `--clock-skew` in the future are rejected.
+These response-time checks apply to fresh queries too; OpenSSL's exit code
+alone is not treated as proof of freshness. Expired entries trigger a live
+query, and failed refreshes never fall back to stale evidence. Existing
+CRL/AIA cache files remain compatible.
 
 Expired or malformed entries, invalid signatures, and future download
 timestamps cause a fresh download. If refreshing fails, stale evidence is
 never used as a fallback; without another usable revocation source the result
 remains `UNKNOWN`.
-Fresh verified downloads are published atomically under hashed URL/type keys,
-so parallel readers cannot see a partially-written entry. Per-URL locks
+Fresh verified downloads are published atomically under hashed request keys,
+so parallel readers cannot see a partially-written entry. Per-key locks
 coalesce concurrent downloads. A busy/abandoned lock is waited on for about
 five seconds, then the check downloads without caching. Cache write failures
 also allow the normal check to continue.
 
 Full reports identify the cache mode (`PER-RUN`, `PERSISTENT`, or `DISABLED`)
-for each host; persistent mode also shows the directory. Every CRL/AIA fetch
+for each host; persistent mode also shows the directory. Every CRL/AIA/OCSP fetch
 explicitly logs whether cached evidence was used:
 
 ```text
   Cache HIT (CRL): USED verified cached download (age: 42s)
+  Cache HIT (OCSP): USED verified cached download (age: 42s)
   Cache MISS (AIA): NOT USED; no fresh verified entry, downloading
   Cache BYPASS (CRL): NOT USED; disabled by --no-cache, downloading
 ```
 
 Unavailable caches and busy locks log `BYPASS` with the reason. The mode line
 describes configuration, not proof of a hit: `USED` is logged only after
-cached evidence passes validation. Hosts needing no CRL/AIA downloads have
+cached evidence passes validation. Hosts needing no CRL/AIA/OCSP requests have
 no per-fetch cache messages.
 These go to standard error with `--json`, and are hidden by `--summary-only`;
 the final status format, JSON fields, and exit codes are unchanged. Cache hits
-avoid HTTP downloads only: TLS connections and any direct OCSP queries still
-take place. Persistent files are not automatically pruned; use a dedicated
-directory in a trusted location and remove old cache files when no checks are
+avoid HTTP downloads and OCSP requests only: each host still gets a fresh TLS
+connection and trust/identity checks. Persistent files are not automatically
+pruned; use a dedicated directory in a trusted location and remove old cache files when no checks are
 running if you need to reclaim space. Use `--no-cache` when you need freshly
 downloaded evidence instead of evidence up to the configured maximum age.
 
@@ -262,7 +284,7 @@ clock skew, and are rejected when older than `--max-ocsp-age` (24 hours by
 default). `STAPLED OCSP` reports the status sent during the TLS handshake; it
 is marked `UNVERIFIED` because OpenSSL's `s_client` text output does not expose
 the raw staple for independent signature verification. The direct OCSP query
-remains the verified revocation result.
+or its reverified, still-current cached response supplies verified OCSP evidence.
 
 The script always requests OCSP stapling (the TLS `status_request` extension)
 so it can report `STAPLED OCSP`. A few servers/load balancers misroute
@@ -390,6 +412,7 @@ bash -n checkCRT.sh
 shellcheck -s bash checkCRT.sh tests/test_cli.sh tests/functional/*.sh
 ./tests/test_cli.sh          # CLI parsing/validation, no network
 ./tests/functional/run.sh    # end-to-end against a local throwaway PKI
+bash tests/functional/ocsp_cache.sh  # OCSP-only cache regressions (also run above)
 ```
 
 `tests/functional/run.sh` builds a disposable root CA, two intermediates, and
@@ -403,6 +426,11 @@ batch mode. Cache regressions count real HTTP fetches for sequential/parallel
 reuse, persistent hits during HTTP outages, TTL and CRL freshness, invalid
 signatures/issuers, safe file publishing, and abandoned locks. JSON assertions
 use `jq`. IPv6 connections are tested when loopback IPv6 is available.
+The OCSP suite uses a BusyBox CGI responder to sign real requests with a
+disposable CA, counts HTTP requests, and tests cache identity isolation,
+signature/freshness rejection, missing `nextUpdate`, and revoked intermediates.
+Its clock shim exercises time limits without changing the system clock or
+requiring Python. All JSON assertions still use `jq`.
 It binds local TCP ports, so it needs permission
 to do so in restricted/sandboxed environments; it makes no real network
 requests.
