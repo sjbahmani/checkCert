@@ -46,7 +46,7 @@ start_server() {
     local key="${cert/\/certs\//\/private\/}"
     key="${key%.pem}.key"
     [[ "$bind_host" == *:* ]] && bind_host="[$bind_host]"
-    local -a args=(-accept "$bind_host:$port" -cert "$cert" -key "$key" -naccept 40 -quiet)
+    local -a args=(-accept "$bind_host:$port" -cert "$cert" -key "$key" -naccept 100 -quiet)
     [[ -n "$chain" ]] && args+=(-cert_chain "$chain")
     openssl s_server "${args[@]}" >"$PKI_DIR/s_server-$port.log" 2>&1 &
     pids+=($!)
@@ -317,6 +317,237 @@ if (( ipv6_available == 1 )); then
 else
     echo 'SKIP: IPv6 backend checks (IPv6 loopback unavailable).'
 fi
+
+# Count real HTTP requests, rather than trusting cache diagnostic messages.
+# The wrapper still calls the actual client against the local HTTP fixture.
+if command -v curl >/dev/null 2>&1; then cache_client=curl; else cache_client=wget; fi
+export CHECKCRT_TEST_FETCH_BIN
+CHECKCRT_TEST_FETCH_BIN=$(command -v "$cache_client")
+export CHECKCRT_TEST_FETCH_LOG="$PKI_DIR/fetch.log"
+export CHECKCRT_TEST_OFFLINE="$PKI_DIR/offline"
+mkdir "$PKI_DIR/fetch-bin"
+cp "$script_dir/fetch_wrapper.sh" "$PKI_DIR/fetch-bin/$cache_client"
+chmod +x "$PKI_DIR/fetch-bin/$cache_client"
+export PATH="$PKI_DIR/fetch-bin:$PATH"
+cache_args=(--no-caa --connect-retries 0 --retry-delay 0 --ca-file "$PKI_DIR/certs/root.pem")
+printf '127.0.0.1 %s\n127.0.0.1 %s\n127.0.0.1 %s\n' \
+    "$AIA_PORT" "$AIA_PORT" "$AIA_PORT" > "$PKI_DIR/hosts-cache.txt"
+
+fetch_count_is() {
+    local actual
+    actual=$(wc -l < "$CHECKCRT_TEST_FETCH_LOG")
+    if [[ "$actual" -eq "$1" ]]; then return 0; fi
+    printf '  Expected %s HTTP requests, got %s:\n' "$1" "$actual"
+    sed 's/^/    /' "$CHECKCRT_TEST_FETCH_LOG"
+    return 1
+}
+seed_cache() {
+    local destination=$1 source=$2 timestamp=${3:-$(date -u +%s)}
+    { printf '# checkCRT-cache-v1 %s\n' "$timestamp"; cat "$source"; } > "$destination"
+}
+
+for parallel in 1 3; do
+    : > "$CHECKCRT_TEST_FETCH_LOG"
+    check_exit "run cache: repeated AIA-only hosts ($parallel workers)" 0 \
+        "$check" "${cache_args[@]}" --json --parallel "$parallel" --hosts-file "$PKI_DIR/hosts-cache.txt"
+    assert_output "run cache downloads AIA and CRL just once ($parallel workers)" fetch_count_is 2
+    assert_output "cache diagnostics do not leak into JSON ($parallel workers)" \
+        json_matches 'length == 3 and all(.[]; .overall == "VALID" and .revocation == "NOT REVOKED")' /tmp/functest.out
+    assert_output "JSON diagnostics identify per-run cache mode ($parallel workers)" \
+        grep -q '^Cache mode: PER-RUN (max age: 14400s)$' /tmp/functest.err
+    assert_output "JSON diagnostics explicitly report reused evidence ($parallel workers)" \
+        grep -q 'Cache HIT (CRL): USED verified cached download' /tmp/functest.err
+done
+
+: > "$CHECKCRT_TEST_FETCH_LOG"
+check_exit "--no-cache bypasses reads/writes even with --cache-dir" 0 \
+    "$check" "${cache_args[@]}" --no-cache --cache-dir "$PKI_DIR/unused-cache" \
+    --parallel 3 --hosts-file "$PKI_DIR/hosts-cache.txt"
+assert_output "uncached repeated hosts each download their own AIA and CRL" fetch_count_is 6
+assert_output "--no-cache does not create a persistent directory" test ! -e "$PKI_DIR/unused-cache"
+assert_output "disabled cache mode is logged" grep -q '^Cache mode: DISABLED (--no-cache)$' /tmp/functest.out
+assert_output "uncached CRL download is explicitly logged" \
+    grep -q 'Cache BYPASS (CRL): NOT USED; disabled by --no-cache' /tmp/functest.out
+assert_output "uncached AIA download is explicitly logged" \
+    grep -q 'Cache BYPASS (AIA): NOT USED; disabled by --no-cache' /tmp/functest.out
+assert_output "disabled cache is not reported as a hit or miss" \
+    test "$(grep -Ec 'Cache (HIT|MISS)' /tmp/functest.out)" = 0
+
+persistent_cache="$PKI_DIR/persistent cache"
+: > "$CHECKCRT_TEST_FETCH_LOG"
+check_exit "persistent cache: populate from AIA and CRL downloads" 0 \
+    "$check" "${cache_args[@]}" --cache-dir="$persistent_cache" --cache-max-age=3600 127.0.0.1 "$AIA_PORT"
+assert_output "cold persistent cache downloads both objects" fetch_count_is 2
+assert_output "persistent cache mode includes the chosen directory" \
+    grep -Fxq "Cache mode: PERSISTENT (max age: 3600s; directory: $persistent_cache)" /tmp/functest.out
+assert_output "cold CRL cache is explicitly logged as not used" \
+    grep -q 'Cache MISS (CRL): NOT USED; no fresh verified entry' /tmp/functest.out
+assert_output "cold AIA cache is explicitly logged as not used" \
+    grep -q 'Cache MISS (AIA): NOT USED; no fresh verified entry' /tmp/functest.out
+crl_entries=("$persistent_cache"/v1-crl-*.pem)
+aia_entries=("$persistent_cache"/v1-aia-*.pem)
+cached_crl=${crl_entries[0]}
+cached_aia=${aia_entries[0]}
+assert_output "persistent directory is private" test "$(stat -c %a "$persistent_cache")" = 700
+assert_output "cache entries are private" test "$(stat -c %a "$cached_crl")" = 600
+cp "$cached_crl" "$PKI_DIR/warm-crl.pem"
+
+: > "$CHECKCRT_TEST_OFFLINE"
+: > "$CHECKCRT_TEST_FETCH_LOG"
+check_exit "warm persistent cache works during HTTP outage" 0 \
+    "$check" "${cache_args[@]}" --cache-dir "$persistent_cache" 127.0.0.1 "$AIA_PORT"
+assert_output "warm AIA and CRL use no HTTP requests" fetch_count_is 0
+assert_output "AIA cache hit reports usage and age" \
+    grep -Eq 'Cache HIT \(AIA\): USED verified cached download \(age: [0-9]+s\)' /tmp/functest.out
+assert_output "CRL cache hit reports usage and age" \
+    grep -Eq 'Cache HIT \(CRL\): USED verified cached download \(age: [0-9]+s\)' /tmp/functest.out
+
+check_exit "cached CRL is checked against each leaf serial, not a cached verdict" 2 \
+    "$check" "${cache_args[@]}" --cache-dir "$persistent_cache" --json --summary-only 127.0.0.1 "$REVOKED_PORT"
+assert_output "cached CRL still reports revocation in JSON" \
+    json_matches 'length == 1 and (.[0] | .revocation == "REVOKED" and .exit_code == 2)' /tmp/functest.out
+assert_output "summary-only suppresses cache diagnostics" test ! -s /tmp/functest.err
+
+check_exit "cached AIA never becomes a trust anchor" 5 \
+    "$check" --no-caa --connect-retries 0 --cache-dir "$persistent_cache" --json --summary-only 127.0.0.1 "$AIA_PORT"
+assert_output "warm cache does not bypass trust-store verification" \
+    json_matches 'length == 1 and (.[0] | .trust == "UNTRUSTED/INVALID" and .exit_code == 5)' /tmp/functest.out
+assert_output "cache hits do not renew the original download timestamp" \
+    cmp -s "$PKI_DIR/warm-crl.pem" "$cached_crl"
+
+: > "$CHECKCRT_TEST_FETCH_LOG"
+check_exit "--no-cache ignores an existing warm cache during HTTP outage" 3 \
+    "$check" "${cache_args[@]}" --cache-dir "$persistent_cache" --no-cache --summary-only 127.0.0.1 "$GOOD_PORT"
+assert_output "--no-cache forces a real download attempt" fetch_count_is 1
+assert_output "--no-cache leaves existing entries untouched" cmp -s "$PKI_DIR/warm-crl.pem" "$cached_crl"
+
+seed_cache "$cached_crl" "$PKI_DIR/www/intermediate.crl" "$(( $(date -u +%s) - 7200 ))"
+: > "$CHECKCRT_TEST_FETCH_LOG"
+check_exit "default four-hour TTL reuses a two-hour-old CRL during HTTP outage" 0 \
+    "$check" "${cache_args[@]}" --cache-dir "$persistent_cache" 127.0.0.1 "$GOOD_PORT"
+assert_output "two-hour-old CRL needs no HTTP request with the default TTL" fetch_count_is 0
+assert_output "persistent cache reports the four-hour default" \
+    grep -Fxq "Cache mode: PERSISTENT (max age: 14400s; directory: $persistent_cache)" /tmp/functest.out
+check_exit "explicit one-hour TTL still rejects a two-hour-old CRL" 3 \
+    "$check" "${cache_args[@]}" --cache-dir "$persistent_cache" --cache-max-age 3600 --summary-only 127.0.0.1 "$GOOD_PORT"
+assert_output "explicit shorter TTL attempts a fresh download" fetch_count_is 1
+
+seed_cache "$cached_crl" "$PKI_DIR/www/intermediate.crl" "$(( $(date -u +%s) - 120 ))"
+: > "$CHECKCRT_TEST_FETCH_LOG"
+check_exit "expired cache TTL plus HTTP outage stays UNKNOWN" 3 \
+    "$check" "${cache_args[@]}" --cache-dir "$persistent_cache" --cache-max-age 60 --json --summary-only 127.0.0.1 "$GOOD_PORT"
+assert_output "expired TTL attempts a fresh fetch" fetch_count_is 1
+assert_output "failed refresh never falls back to stale evidence" \
+    json_matches 'length == 1 and (.[0] | .trust == "TRUSTED" and .revocation == "UNKNOWN" and .exit_code == 3)' /tmp/functest.out
+
+# A signed CRL just past nextUpdate is still within the normal clock-skew
+# allowance. Cache reuse must nevertheless reject it, with a recent fetch time.
+openssl ca -config "$PKI_DIR/ca_intermediate.cnf" -gencrl \
+    -crl_lastupdate "$(date -u -d '2 days ago' +%Y%m%d%H%M%SZ)" \
+    -crl_nextupdate "$(date -u -d '1 minute ago' +%Y%m%d%H%M%SZ)" \
+    -out "$PKI_DIR/stale.crl" >/dev/null 2>&1
+seed_cache "$cached_crl" "$PKI_DIR/stale.crl"
+check_exit "cached CRL past nextUpdate is rejected even within clock skew" 3 \
+    "$check" "${cache_args[@]}" --cache-dir "$persistent_cache" --summary-only 127.0.0.1 "$GOOD_PORT"
+
+openssl ca -config "$PKI_DIR/ca_intermediate.cnf" -gencrl \
+    -crl_lastupdate "$(date -u -d tomorrow +%Y%m%d%H%M%SZ)" \
+    -crl_nextupdate "$(date -u -d '2 days' +%Y%m%d%H%M%SZ)" \
+    -out "$PKI_DIR/future.crl" >/dev/null 2>&1
+seed_cache "$cached_crl" "$PKI_DIR/future.crl"
+check_exit "cached CRL with a future lastUpdate is rejected" 3 \
+    "$check" "${cache_args[@]}" --cache-dir "$persistent_cache" --summary-only 127.0.0.1 "$GOOD_PORT"
+
+rm -f "$CHECKCRT_TEST_OFFLINE"
+openssl crl -in "$PKI_DIR/www/intermediate.crl" -badsig -out "$PKI_DIR/badsig.crl"
+printf 'not a CRL\n' > "$PKI_DIR/garbage.crl"
+for bad_crl in stale future badsig garbage; do
+    seed_cache "$cached_crl" "$PKI_DIR/$bad_crl.crl"
+    : > "$CHECKCRT_TEST_FETCH_LOG"
+    check_exit "invalid cached CRL ($bad_crl) is refreshed" 0 \
+        "$check" "${cache_args[@]}" --cache-dir "$persistent_cache" 127.0.0.1 "$GOOD_PORT"
+    assert_output "invalid cached CRL ($bad_crl) requires one real fetch" fetch_count_is 1
+done
+
+seed_cache "$cached_crl" "$PKI_DIR/www/root.crl"
+: > "$CHECKCRT_TEST_FETCH_LOG"
+check_exit "cached CRL signed by the wrong issuer is refreshed" 0 \
+    "$check" "${cache_args[@]}" --cache-dir "$persistent_cache" 127.0.0.1 "$GOOD_PORT"
+assert_output "wrong-issuer CRL cannot satisfy a cache hit" fetch_count_is 1
+
+for timestamp in "$(( $(date -u +%s) - 18000 ))" "$(( $(date -u +%s) + 7200 ))"; do
+    seed_cache "$cached_crl" "$PKI_DIR/www/intermediate.crl" "$timestamp"
+    : > "$CHECKCRT_TEST_FETCH_LOG"
+    check_exit "out-of-range cache timestamp triggers refresh" 0 \
+        "$check" "${cache_args[@]}" --cache-dir "$persistent_cache" 127.0.0.1 "$GOOD_PORT"
+    assert_output "cache age is enforced independently of CRL validity" fetch_count_is 1
+done
+
+seed_cache "$cached_aia" "$PKI_DIR/certs/root.pem"
+: > "$CHECKCRT_TEST_FETCH_LOG"
+check_exit "wrong cached AIA issuer is replaced" 0 \
+    "$check" "${cache_args[@]}" --cache-dir "$persistent_cache" 127.0.0.1 "$AIA_PORT"
+assert_output "wrong AIA issuer triggers one fetch, retaining the good CRL" fetch_count_is 1
+
+openssl req -new -x509 -key "$PKI_DIR/private/root.key" -days 30 \
+    -subj '/O=checkCRT Test/CN=checkCRT Test Intermediate CA' \
+    -addext 'basicConstraints=critical,CA:true' -out "$PKI_DIR/impostor.pem" >/dev/null 2>&1
+seed_cache "$cached_aia" "$PKI_DIR/impostor.pem"
+: > "$CHECKCRT_TEST_FETCH_LOG"
+check_exit "same-subject cached AIA issuer with the wrong key is rejected" 0 \
+    "$check" "${cache_args[@]}" --cache-dir "$persistent_cache" 127.0.0.1 "$AIA_PORT"
+assert_output "AIA cache requires a signature check, not just a name match" fetch_count_is 1
+
+seed_cache "$cached_aia" "$PKI_DIR/certs/intermediate.pem" "$(( $(date -u +%s) - 18000 ))"
+: > "$CHECKCRT_TEST_FETCH_LOG"
+check_exit "AIA cache has a bounded age too" 0 \
+    "$check" "${cache_args[@]}" --cache-dir "$persistent_cache" 127.0.0.1 "$AIA_PORT"
+assert_output "expired AIA cache is refreshed" fetch_count_is 1
+
+# Publishing a refreshed entry replaces a symlink, not its target.
+mv "$cached_crl" "$PKI_DIR/original-cache-entry.pem"
+cp "$PKI_DIR/original-cache-entry.pem" "$PKI_DIR/cache-sentinel.pem"
+ln -s "$PKI_DIR/cache-sentinel.pem" "$cached_crl"
+: > "$CHECKCRT_TEST_FETCH_LOG"
+check_exit "symlink cache entry is ignored and safely replaced" 0 \
+    "$check" "${cache_args[@]}" --cache-dir "$persistent_cache" 127.0.0.1 "$GOOD_PORT"
+assert_output "symlink does not supply a cache hit" fetch_count_is 1
+assert_output "cache publishing does not modify the symlink target" \
+    cmp -s "$PKI_DIR/original-cache-entry.pem" "$PKI_DIR/cache-sentinel.pem"
+assert_output "published cache entry is a regular file" test ! -L "$cached_crl"
+
+# Invalid freshly-downloaded data must not poison a subsequent run's cache.
+cp "$PKI_DIR/www/intermediate.crl" "$PKI_DIR/original.crl"
+cp "$PKI_DIR/badsig.crl" "$PKI_DIR/www/intermediate.crl"
+check_exit "invalid downloaded CRL is not cached" 3 \
+    "$check" "${cache_args[@]}" --cache-dir "$PKI_DIR/invalid-cache" 127.0.0.1 "$GOOD_PORT"
+invalid_entries=("$PKI_DIR/invalid-cache"/*.pem)
+assert_output "bad signature leaves no cache entry" test ! -e "${invalid_entries[0]}"
+cp "$PKI_DIR/original.crl" "$PKI_DIR/www/intermediate.crl"
+
+# Both supported HTTP encodings must be normalized before cache publication.
+openssl crl -in "$PKI_DIR/original.crl" -outform DER -out "$PKI_DIR/www/intermediate.crl"
+openssl x509 -in "$PKI_DIR/certs/intermediate.pem" -outform DER -out "$PKI_DIR/www/intermediate.crt"
+check_exit "DER CRL and AIA downloads are cached as PEM" 0 \
+    "$check" "${cache_args[@]}" --cache-dir "$PKI_DIR/der-cache" 127.0.0.1 "$AIA_PORT"
+der_crls=("$PKI_DIR/der-cache"/v1-crl-*.pem)
+der_issuers=("$PKI_DIR/der-cache"/v1-aia-*.pem)
+assert_output "DER CRL cache entry contains PEM" grep -q '^-----BEGIN X509 CRL-----$' "${der_crls[0]}"
+assert_output "DER AIA cache entry contains PEM" grep -q '^-----BEGIN CERTIFICATE-----$' "${der_issuers[0]}"
+cp "$PKI_DIR/original.crl" "$PKI_DIR/www/intermediate.crl"
+cp "$PKI_DIR/certs/intermediate.pem" "$PKI_DIR/www/intermediate.crt"
+
+# A leftover lock from an interrupted process must not hang or reuse stale data.
+seed_cache "$cached_crl" "$PKI_DIR/stale.crl"
+mkdir "$cached_crl.lock"
+: > "$CHECKCRT_TEST_FETCH_LOG"
+check_exit "abandoned cache lock falls back to a bounded uncached fetch" 0 \
+    timeout 15 "$check" "${cache_args[@]}" --cache-dir "$persistent_cache" 127.0.0.1 "$GOOD_PORT"
+assert_output "busy lock still permits a fresh HTTP request" fetch_count_is 1
+assert_output "busy lock fallback is explained" \
+    grep -q 'Cache BYPASS (CRL): NOT USED; cache unavailable/busy' /tmp/functest.err
+assert_output "busy lock is not also logged as a normal miss" \
+    test "$(grep -c 'Cache MISS (CRL)' /tmp/functest.out)" = 0
 
 echo
 echo "Functional tests: $pass passed, $fail failed."

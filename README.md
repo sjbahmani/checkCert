@@ -13,6 +13,9 @@ and AIA issuer URLs are detected and skipped with a clear message, since they
 cannot be fetched by `curl`/`wget` in this script. `dig`, `host`, or
 `nslookup` (any one of them) is required for the CAA record lookup; the
 lookup is skipped, not fatal, when none are installed.
+Persistent caching (`--cache-dir`) also uses GNU `stat` to check directory
+permissions. Cache file operations use standard GNU coreutils (`cp`, `mv`,
+`mkdir`, and `rmdir`); no additional service or runtime JSON tool is needed.
 
 ## Usage
 
@@ -30,6 +33,8 @@ lookup is skipped, not fatal, when none are installed.
 ./checkCRT.sh --summary-only example.com
 ./checkCRT.sh --summary-only --hosts-file hosts.txt
 ./checkCRT.sh --connect-ip 192.0.2.10 example.com
+./checkCRT.sh --cache-dir "$HOME/.cache/checkCRT" --hosts-file hosts.txt
+./checkCRT.sh --no-cache example.com
 ```
 
 The script always validates the chain and the supplied hostname (or IP address)
@@ -103,6 +108,69 @@ JSON/NDJSON keeps the original `host` and adds `connect_ip`, containing the
 override without brackets or `null` when no override was supplied. This field
 is also included in connection-error records; it is not a DNS-resolved address.
 
+## CRL and AIA caching
+
+Verified CRL downloads and AIA issuer certificates are shared between hosts
+in the same invocation by default, including parallel batch checks. The
+temporary cache is removed when the run exits. To reuse downloads across
+runs, choose a persistent directory:
+
+```bash
+./checkCRT.sh --cache-dir "$HOME/.cache/checkCRT" --hosts-file hosts.txt
+./checkCRT.sh --cache-dir "$HOME/.cache/checkCRT" --cache-max-age 300 example.com
+./checkCRT.sh --no-cache example.com
+```
+
+- `--cache-dir DIR` (also `--cache-dir=DIR`) creates the directory if needed.
+  It must be owned by you, readable/writable/searchable, not a symlink, and
+  not group- or world-writable. New directories and cache entries are private
+  (`700` and `600`). Existing directory permissions are never changed.
+- `--cache-max-age N` limits both CRL and AIA download age to
+  **14400 seconds (4 hours)** by default. Accepts positive integer seconds,
+  up to 9 digits. Reuse does not reset the download timestamp.
+- `--no-cache` bypasses all cache reads and writes, even when `--cache-dir`
+  is also supplied, and does not create that directory.
+
+Each cache hit is revalidated. A CRL must verify against the certificate's
+actual issuer, have a usable update period, and still be before `nextUpdate`;
+clock-skew tolerance never extends its cache lifetime. An AIA certificate
+must match the expected issuer and verify the leaf. The normal trust-store,
+identity, expiry, and revocation checks still run: cached issuers are **not**
+added to the trust store, and a CRL is checked separately against every
+certificate's serial number. Neither verdicts nor OCSP responses are cached.
+
+Expired or malformed entries, invalid signatures, and future download
+timestamps cause a fresh download. If refreshing fails, stale evidence is
+never used as a fallback; without another usable revocation source the result
+remains `UNKNOWN`.
+Fresh verified downloads are published atomically under hashed URL/type keys,
+so parallel readers cannot see a partially-written entry. Per-URL locks
+coalesce concurrent downloads. A busy/abandoned lock is waited on for about
+five seconds, then the check downloads without caching. Cache write failures
+also allow the normal check to continue.
+
+Full reports identify the cache mode (`PER-RUN`, `PERSISTENT`, or `DISABLED`)
+for each host; persistent mode also shows the directory. Every CRL/AIA fetch
+explicitly logs whether cached evidence was used:
+
+```text
+  Cache HIT (CRL): USED verified cached download (age: 42s)
+  Cache MISS (AIA): NOT USED; no fresh verified entry, downloading
+  Cache BYPASS (CRL): NOT USED; disabled by --no-cache, downloading
+```
+
+Unavailable caches and busy locks log `BYPASS` with the reason. The mode line
+describes configuration, not proof of a hit: `USED` is logged only after
+cached evidence passes validation. Hosts needing no CRL/AIA downloads have
+no per-fetch cache messages.
+These go to standard error with `--json`, and are hidden by `--summary-only`;
+the final status format, JSON fields, and exit codes are unchanged. Cache hits
+avoid HTTP downloads only: TLS connections and any direct OCSP queries still
+take place. Persistent files are not automatically pruned; use a dedicated
+directory in a trusted location and remove old cache files when no checks are
+running if you need to reclaim space. Use `--no-cache` when you need freshly
+downloaded evidence instead of evidence up to the configured maximum age.
+
 ## Batch mode
 
 `--hosts-file FILE` checks every host in `FILE` instead of a single
@@ -116,7 +184,7 @@ internal.example 8443
 mail.example.com 587
 ```
 
-Every other option (`--ca-file`, `--connect-ip`, `--starttls`, timeouts, `--expiry-warn-days`,
+Every other option (`--ca-file`, `--connect-ip`, `--cache-dir`, `--starttls`, timeouts, `--expiry-warn-days`,
 ...) applies to every host in the file — there is no per-host override. In
 `--json` mode each host writes one JSON object, so standard output becomes
 newline-delimited JSON (NDJSON), not a single array. The process exit code is
@@ -319,7 +387,7 @@ These are development dependencies; running `checkCRT.sh` does not require
 
 ```bash
 bash -n checkCRT.sh
-shellcheck -s bash checkCRT.sh
+shellcheck -s bash checkCRT.sh tests/test_cli.sh tests/functional/*.sh
 ./tests/test_cli.sh          # CLI parsing/validation, no network
 ./tests/functional/run.sh    # end-to-end against a local throwaway PKI
 ```
@@ -331,7 +399,10 @@ three leaves (see `tests/functional/setup_pki.sh`), serves them over local
 revoked intermediate (with an otherwise-fine leaf), a server that omits its
 intermediate (regression test for AIA-based chain recovery), `--connect-ip`
 with hostname/SNI preservation and mismatch rejection, and `--hosts-file`
-batch mode. IPv6 connections are tested when loopback IPv6 is available.
+batch mode. Cache regressions count real HTTP fetches for sequential/parallel
+reuse, persistent hits during HTTP outages, TTL and CRL freshness, invalid
+signatures/issuers, safe file publishing, and abandoned locks. JSON assertions
+use `jq`. IPv6 connections are tested when loopback IPv6 is available.
 It binds local TCP ports, so it needs permission
 to do so in restricted/sandboxed environments; it makes no real network
 requests.

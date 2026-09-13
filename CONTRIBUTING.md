@@ -15,7 +15,7 @@ runs on every push and pull request:
 
 ```bash
 bash -n checkCRT.sh
-shellcheck -s bash checkCRT.sh tests/functional/run.sh tests/functional/setup_pki.sh tests/test_cli.sh
+shellcheck -s bash checkCRT.sh tests/test_cli.sh tests/functional/*.sh
 ./tests/test_cli.sh
 ./tests/functional/run.sh
 ```
@@ -31,7 +31,9 @@ errors — CI fails on warnings too).
   local `busybox httpd` on `127.0.0.1`. It exercises revocation (leaf and
   intermediate), the AIA chain-recovery path, the OCSP-stapling retry
   fallback, and `--hosts-file` batch mode (both sequential and parallel),
-  asserting exit codes and specific output. It makes no real network
+  asserting exit codes and specific output. Cache tests count actual CRL/AIA
+  downloads through `fetch_wrapper.sh` and exercise freshness, signature
+  verification, outages, and parallel reuse. It makes no real network
   requests, but it does bind local TCP ports, so in a sandboxed environment
   you may need to grant permission for that.
 

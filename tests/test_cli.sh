@@ -25,8 +25,12 @@ expect_exit 0 "$script" --help
 grep -q -- '--json' "$scratch/stdout"
 grep -q -- '--summary-only' "$scratch/stdout"
 grep -q -- '--connect-ip' "$scratch/stdout"
+grep -q -- '--cache-dir' "$scratch/stdout"
+grep -q -- '--cache-max-age' "$scratch/stdout"
+grep -q -- '--cache-max-age .*default: 14400;' "$scratch/stdout"
+grep -q -- '--no-cache' "$scratch/stdout"
 expect_exit 0 "$script" --version
-grep -q '^checkCRT.sh 1\.12\.0$' "$scratch/stdout"
+grep -q '^checkCRT.sh 1\.13\.2$' "$scratch/stdout"
 expect_exit 1 "$script" --connect-timeout 0 example.com
 grep -q 'positive number' "$scratch/stderr"
 expect_exit 1 "$script" --ca-file "$scratch/missing.pem" example.com
@@ -61,5 +65,25 @@ for valid_ip in 127.0.0.1 0.0.0.0 255.255.255.255 '::' '::1' '[::1]' \
     expect_exit 1 "$script" --connect-ip "$valid_ip" --ca-file "$scratch/missing.pem" backend.test
     grep -q 'CA file is not readable' "$scratch/stderr"
 done
+
+for option in --cache-dir --cache-max-age; do
+    expect_exit 1 "$script" "$option"
+    grep -q -- "$option requires a value" "$scratch/stderr"
+done
+for invalid_age in '' 0 -1 text 1.5 9999999999; do
+    expect_exit 1 "$script" "--cache-max-age=$invalid_age" example.com
+    grep -q -- '--cache-max-age must be a positive integer' "$scratch/stderr"
+done
+expect_exit 1 "$script" --cache-dir= example.com
+grep -q -- '--cache-dir requires a non-empty directory path' "$scratch/stderr"
+expect_exit 1 "$script" --cache-dir "$scratch/stdout" example.com
+grep -q -- '--cache-dir must be a readable/writable directory' "$scratch/stderr"
+mkdir "$scratch/shared-cache"
+chmod 777 "$scratch/shared-cache"
+expect_exit 1 "$script" --cache-dir "$scratch/shared-cache" example.com
+grep -q -- '--cache-dir must not be group- or world-writable' "$scratch/stderr"
+ln -s "$scratch/shared-cache" "$scratch/link-cache"
+expect_exit 1 "$script" --cache-dir "$scratch/link-cache///" example.com
+grep -q -- '--cache-dir must be a readable/writable directory' "$scratch/stderr"
 
 echo 'CLI regression tests passed.'

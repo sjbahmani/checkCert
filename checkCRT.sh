@@ -9,7 +9,7 @@
 
 set -u -o pipefail
 
-VERSION=1.12.0
+VERSION=1.13.2
 verify_peer=1
 ca_file=
 ca_path=
@@ -18,6 +18,10 @@ summary_only=0
 connect_ip=
 connect_ip_set=0
 connect_ip_json=null
+cache_enabled=1
+cache_dir=
+cache_dir_set=0
+cache_max_age=14400
 connect_timeout=5
 request_timeout=20
 connect_retries=4
@@ -50,6 +54,12 @@ Options:
                       (hosts file). With --json, suppress diagnostics.
   --connect-ip IP     Connect to this IPv4/IPv6 address, keeping the original
                       hostname for SNI and identity checks. Applies to all hosts.
+  --cache-dir DIR     Keep verified CRL/AIA downloads between runs in a private
+                      directory. By default, the cache lasts only this run.
+  --cache-max-age N   Maximum cached download age in seconds (default: 14400;
+                      4 hours).
+                      CRLs are never reused past nextUpdate.
+  --no-cache          Disable cache reads and writes, including --cache-dir.
   --connect-timeout N TLS connection timeout in seconds (default: 5).
   --request-timeout N CRL/OCSP request timeout in seconds (default: 20).
   --connect-retries N Retry a failed network operation (initial TLS
@@ -92,13 +102,16 @@ while (( $# > 0 )); do
         --verify-peer) verify_peer=1 ;;
         --json) output_format=json ;;
         --summary-only) summary_only=1 ;;
+        --no-cache) cache_enabled=0 ;;
         --no-caa) check_caa=0 ;;
         --fail-on-expiry-warning) fail_on_expiry_warning=1 ;;
-        --connect-ip|--connect-timeout|--request-timeout|--connect-retries|--retry-delay|--max-ocsp-age|--clock-skew|--proxy|--no-proxy|--ca-path|--starttls|--expiry-warn-days|--hosts-file|--parallel)
+        --cache-dir|--cache-max-age|--connect-ip|--connect-timeout|--request-timeout|--connect-retries|--retry-delay|--max-ocsp-age|--clock-skew|--proxy|--no-proxy|--ca-path|--starttls|--expiry-warn-days|--hosts-file|--parallel)
             option_name=$1
             shift
             [[ $# -gt 0 ]] || { echo "Error: $option_name requires a value." >&2; exit 1; }
             case $option_name in
+                --cache-dir) cache_dir=$1; cache_dir_set=1 ;;
+                --cache-max-age) cache_max_age=$1 ;;
                 --connect-ip) connect_ip=$1; connect_ip_set=1 ;;
                 --connect-timeout) connect_timeout=$1 ;;
                 --request-timeout) request_timeout=$1 ;;
@@ -122,6 +135,8 @@ while (( $# > 0 )); do
             ;;
         --ca-file=*) ca_file=${1#--ca-file=} ;;
         --ca-path=*) ca_path=${1#--ca-path=} ;;
+        --cache-dir=*) cache_dir=${1#--cache-dir=}; cache_dir_set=1 ;;
+        --cache-max-age=*) cache_max_age=${1#--cache-max-age=} ;;
         --connect-ip=*) connect_ip=${1#--connect-ip=}; connect_ip_set=1 ;;
         --connect-timeout=*) connect_timeout=${1#--connect-timeout=} ;;
         --request-timeout=*) request_timeout=${1#--request-timeout=} ;;
@@ -237,6 +252,34 @@ if ! [[ "$batch_parallel" =~ ^[0-9]+$ ]] || (( batch_parallel < 1 )); then
     echo "Error: --parallel must be a positive integer." >&2
     exit 1
 fi
+if ! [[ "$cache_max_age" =~ ^[0-9]{1,9}$ ]] || (( 10#$cache_max_age < 1 )); then
+    echo "Error: --cache-max-age must be a positive integer of at most 9 digits (seconds)." >&2
+    exit 1
+fi
+cache_max_age=$((10#$cache_max_age))
+if (( cache_dir_set == 1 )) && [[ -z "$cache_dir" ]]; then
+    echo "Error: --cache-dir requires a non-empty directory path." >&2
+    exit 1
+fi
+if (( cache_enabled == 1 && cache_dir_set == 1 )); then
+    # Persistent evidence must not be replaceable by another local user. Never
+    # chmod an existing user directory, and reject symlinked final components.
+    while [[ "$cache_dir" != / && "$cache_dir" == */ ]]; do cache_dir=${cache_dir%/}; done
+    if ! command -v stat >/dev/null 2>&1; then
+        echo "Error: GNU stat is required with --cache-dir." >&2
+        exit 3
+    fi
+    if [[ -L "$cache_dir" ]] || ! (umask 077; mkdir -p -- "$cache_dir") \
+        || [[ ! -d "$cache_dir" || ! -O "$cache_dir" || ! -r "$cache_dir" || ! -w "$cache_dir" || ! -x "$cache_dir" ]]; then
+        echo "Error: --cache-dir must be a readable/writable directory owned by you, not a symlink." >&2
+        exit 1
+    fi
+    cache_mode=$(stat -c '%a' -- "$cache_dir") || exit 3
+    if ! [[ "$cache_mode" =~ ^[0-7]{3,4}$ ]] || (( (8#$cache_mode & 0022) != 0 )); then
+        echo "Error: --cache-dir must not be group- or world-writable (use a private directory)." >&2
+        exit 1
+    fi
+fi
 for command in openssl awk sed grep mktemp timeout tr sort date; do
     command -v "$command" >/dev/null 2>&1 || {
         echo "Error: '$command' is required." >&2; exit 3;
@@ -263,8 +306,12 @@ if [[ "$output_format" == json ]]; then
     exec 1>&2
 fi
 
-workdir=$(mktemp -d "${TMPDIR:-/tmp}/checkcrl.XXXXXX")
+workdir=$(mktemp -d "${TMPDIR:-/tmp}/checkcrl.XXXXXX") || exit 3
 trap 'rm -rf "$workdir"' EXIT
+if (( cache_enabled == 1 && cache_dir_set == 0 )); then
+    cache_dir="$workdir/cache"
+    mkdir -m 700 -- "$cache_dir" || exit 3
+fi
 
 # The main trust decision (openssl verify, no -CAfile) already consults the
 # system's default trust store, which is why TRUST can read TRUSTED even when
@@ -385,6 +432,104 @@ crl_is_current() {
     (( last_epoch <= now + clock_skew && next_epoch > now - clock_skew ))
 }
 
+# Cache entries are evidence, never trust anchors or cached verdicts. Validate
+# each object against this host's actual issuer/leaf, even on a cache hit.
+cache_object_is_valid() {
+    local kind=$1 object=$2 verifier=$3 next_update next_epoch
+    if [[ "$kind" == aia ]]; then
+        is_issuer_of_leaf "$object"
+    else
+        [[ -n "$verifier" ]] || return 1
+        openssl crl -in "$object" -noout -verify -CAfile "$verifier" >/dev/null 2>&1 || return 1
+        crl_is_current "$object" 2>/dev/null || return 1
+        # Do not use clock-skew tolerance to extend the cache's lifetime.
+        next_update=$(openssl crl -in "$object" -noout -nextupdate 2>/dev/null | sed 's/^nextUpdate=//')
+        next_epoch=$(date -u -d "$next_update" +%s 2>/dev/null) || return 1
+        (( next_epoch > $(date -u +%s) ))
+    fi
+}
+
+cache_read() {
+    local kind=$1 entry=$2 destination=$3 verifier=$4 header fetched_at now
+    [[ -f "$entry" && ! -L "$entry" ]] || return 1
+    # Snapshot a single, atomically-published file: metadata and PEM cannot
+    # come from different downloads during parallel checks.
+    cp -- "$entry" "$destination" 2>/dev/null || return 1
+    IFS= read -r header < "$destination" || return 1
+    [[ "$header" =~ ^'# checkCRT-cache-v1 '([0-9]{1,12})$ ]] || return 1
+    fetched_at=$((10#${BASH_REMATCH[1]}))
+    now=$(date -u +%s)
+    (( fetched_at <= now && now - fetched_at < cache_max_age )) || return 1
+    cache_object_is_valid "$kind" "$destination" "$verifier" || return 1
+    printf '  Cache HIT (%s): USED verified cached download (age: %ss)\n' "${kind^^}" "$((now - fetched_at))"
+}
+
+# Normalize DER/PEM downloads to PEM. A short, per-URL mkdir lock coalesces
+# parallel downloads without flock or a persistent lock daemon. An abandoned
+# lock costs at most five seconds, then we fetch without caching; it cannot
+# make us accept old evidence. Subshell-scoped cleanup never affects a host's
+# or the parent process's EXIT trap.
+fetch_cached_object() (
+    local kind=$1 url=$2 destination=$3 verifier=${4:-}
+    local key entry='' lock_dir='' lock_held=0 cache_temp=''
+    local lock_deadline=$((SECONDS + 5))
+    local decoder fetched_at
+    trap '[[ -z "$cache_temp" ]] || rm -f -- "$cache_temp"; if (( lock_held == 1 )); then rmdir -- "$lock_dir" 2>/dev/null || true; fi' EXIT
+    if (( cache_enabled == 1 )); then
+        key=$(printf '%s\n%s' "$kind" "$url" | openssl dgst -sha256 | awk '{print $NF}')
+        if [[ "$key" =~ ^[[:xdigit:]]{64}$ ]]; then
+            entry="$cache_dir/v1-$kind-$key.pem"
+            lock_dir="$entry.lock"
+            if cache_read "$kind" "$entry" "$destination" "$verifier"; then exit 0; fi
+            while :; do
+                if (umask 077; mkdir -- "$lock_dir") 2>/dev/null; then
+                    lock_held=1
+                    # Another worker may have published after our first read.
+                    if cache_read "$kind" "$entry" "$destination" "$verifier"; then exit 0; fi
+                    break
+                fi
+                if cache_read "$kind" "$entry" "$destination" "$verifier"; then exit 0; fi
+                # A missing lock here can mean its owner just published and
+                # released it, not a cache failure. Retry the read/acquisition.
+                if [[ ! -d "$cache_dir" || ! -w "$cache_dir" || -L "$lock_dir" ]] || (( SECONDS >= lock_deadline )); then
+                    echo "  Cache BYPASS (${kind^^}): NOT USED; cache unavailable/busy, downloading without caching." >&2
+                    break
+                fi
+                sleep 0.1
+            done
+            if (( lock_held == 1 )); then
+                printf '  Cache MISS (%s): NOT USED; no fresh verified entry, downloading\n' "${kind^^}"
+            fi
+        else
+            echo "  Cache BYPASS (${kind^^}): NOT USED; unable to compute cache key, downloading without caching." >&2
+        fi
+    else
+        printf '  Cache BYPASS (%s): NOT USED; disabled by --no-cache, downloading\n' "${kind^^}"
+    fi
+    fetched_at=$(date -u +%s)
+    if ! fetch "$url" "$destination.download"; then exit 1; fi
+    decoder=crl
+    [[ "$kind" == aia ]] && decoder=x509
+    if openssl "$decoder" -inform DER -in "$destination.download" -out "$destination" >/dev/null 2>&1; then :
+    elif openssl "$decoder" -inform PEM -in "$destination.download" -out "$destination" >/dev/null 2>&1; then :
+    else
+        echo "  Result: downloaded file is not a readable ${kind^^} object" >&2
+        exit 1
+    fi
+    if (( lock_held == 1 )) && cache_object_is_valid "$kind" "$destination" "$verifier"; then
+        if cache_temp=$(mktemp "$cache_dir/.checkcrt-cache.XXXXXX") \
+            && { printf '# checkCRT-cache-v1 %s\n' "$fetched_at"; cat "$destination"; } > "$cache_temp" \
+            && mv -fT -- "$cache_temp" "$entry"; then
+            cache_temp=
+        else
+            echo "  Warning: unable to save ${kind^^} cache entry; using the downloaded object." >&2
+        fi
+    fi
+    # The caller still checks signature, validity and trust. In particular,
+    # an invalid newly-downloaded object is never written to the cache.
+    exit 0
+)
+
 crl_has_serial_for() {
     # Comparing the extracted value avoids prefix matches (e.g. AB vs ABC).
     local crl=$1 target=$2
@@ -413,7 +558,7 @@ certificate_issuer() {
 # a revoked intermediate is caught even when the leaf itself is fine.
 check_certificate_revocation() {
     local cert=$1 label=$2 verifier=$3
-    local cert_serial local_crl_urls idx url downloaded crl_pem
+    local cert_serial local_crl_urls idx url crl_pem
     local checked_local=0 revoked_local=0 ocsp_good_local=0
     local ocsp_url_local ocsp_output ocsp_rc ocsp_proxy_args ocsp_attempt
 
@@ -433,14 +578,10 @@ check_certificate_revocation() {
 
     for idx in "${!local_crl_urls[@]}"; do
         url=${local_crl_urls[$idx]}
-        downloaded="$host_workdir/crl-$$-$RANDOM-${idx}.bin"
         crl_pem="$host_workdir/crl-$$-$RANDOM-${idx}.pem"
         echo; echo "Checking CRL ($label): $url"
         if is_ldap_url "$url"; then echo "  Result: LDAP CRL retrieval is not supported by this script" >&2; continue; fi
-        if ! fetch "$url" "$downloaded"; then echo "  Result: unable to download CRL" >&2; continue; fi
-        if openssl crl -inform DER -in "$downloaded" -out "$crl_pem" >/dev/null 2>&1; then :
-        elif openssl crl -inform PEM -in "$downloaded" -out "$crl_pem" >/dev/null 2>&1; then :
-        else echo "  Result: downloaded file is not a readable CRL" >&2; continue; fi
+        if ! fetch_cached_object crl "$url" "$crl_pem" "$verifier"; then echo "  Result: unable to retrieve a usable CRL" >&2; continue; fi
         openssl crl -in "$crl_pem" -noout -issuer -lastupdate -nextupdate
         if [[ -z "$verifier" ]] || ! openssl crl -in "$crl_pem" -noout -verify -CAfile "$verifier" >/dev/null 2>&1; then
             echo "  Result: CRL signature could not be verified" >&2; continue
@@ -522,7 +663,7 @@ check_host_details() {
     local certificate_expired expiry_warning expiry_days_left end_date end_epoch
     local leaf_issuer issuer_cert issuer_cn
     local -a issuer_urls=()
-    local index issuer_download issuer_candidate
+    local index issuer_candidate
     local chain_bundle
     local -a verify_args=() chain_only_args=()
     local peer_valid=0
@@ -563,6 +704,13 @@ check_host_details() {
     fi
 
     echo "Fetching TLS certificate from ${domain}:${port} ...${starttls_proto:+ (STARTTLS: $starttls_proto)}"
+    if (( cache_enabled == 0 )); then
+        echo "Cache mode: DISABLED (--no-cache)"
+    elif (( cache_dir_set == 1 )); then
+        printf 'Cache mode: PERSISTENT (max age: %ss; directory: %s)\n' "$cache_max_age" "$cache_dir"
+    else
+        printf 'Cache mode: PER-RUN (max age: %ss)\n' "$cache_max_age"
+    fi
     [[ -n "$connect_ip" ]] && echo "Connection target: $connect_target (identity: $connection_host)"
     connect_attempt=0
     connect_ok=0
@@ -753,13 +901,9 @@ check_host_details() {
                 | grep -oE 'CA Issuers - URI:[^,[:space:]]+' | sed 's/^CA Issuers - URI://' | sort -u
         )
         for index in "${!issuer_urls[@]}"; do
-            issuer_download="$host_workdir/issuer-${index}.bin"
             issuer_candidate="$host_workdir/issuer-${index}.pem"
             if is_ldap_url "${issuer_urls[$index]}"; then continue; fi
-            if ! fetch "${issuer_urls[$index]}" "$issuer_download"; then continue; fi
-            if openssl x509 -inform DER -in "$issuer_download" -out "$issuer_candidate" >/dev/null 2>&1; then :
-            elif openssl x509 -inform PEM -in "$issuer_download" -out "$issuer_candidate" >/dev/null 2>&1; then :
-            else continue; fi
+            if ! fetch_cached_object aia "${issuer_urls[$index]}" "$issuer_candidate"; then continue; fi
             if is_issuer_of_leaf "$issuer_candidate"; then issuer_cert=$issuer_candidate; break; fi
         done
     fi

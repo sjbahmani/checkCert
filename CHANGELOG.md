@@ -1,5 +1,32 @@
 # Changelog
 
+## 1.13.2
+
+- Increase the default CRL/AIA cache lifetime to 14400 seconds (4 hours).
+  `--cache-max-age` still overrides it, and CRLs remain bounded by
+  `nextUpdate` regardless of the configured cache lifetime.
+
+## 1.13.1
+
+- Cache diagnostics explicitly report `USED` on verified hits (with download
+  age) and `NOT USED` on misses or bypasses, including disabled/unavailable
+  caches. Each host also logs its cache mode and persistent directory.
+- Preserve JSON/NDJSON standard output and summary-only suppression; add
+  regressions for the new logging without changing verification or exit codes.
+
+## 1.13.0
+
+- Share verified CRL/AIA downloads between hosts in a run, with parallel
+  download coalescing. Add `--cache-dir DIR` for reuse between runs,
+  `--cache-max-age N` (default 3600 seconds), and `--no-cache` to bypass it.
+- Cache hits recheck signatures, issuer relationships, and freshness. CRLs
+  are never reused past `nextUpdate`; failed refreshes cannot fall back to
+  stale evidence. Cached issuers do not become trust anchors.
+- Cache entries use private files and atomic replacement. Busy/abandoned
+  locks and write failures fall back to checking without caching.
+- Add local PKI regressions for cache reuse, HTTP outages, corrupt/stale
+  evidence, trust isolation, and concurrent access, with `jq` JSON assertions.
+
 ## 1.12.0
 
 - Added `--connect-ip IP` to connect to an IPv4/IPv6 backend while keeping
