@@ -10,6 +10,17 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 project_root=$(cd "$script_dir/../.." && pwd)
 check="$project_root/checkCRT.sh"
 
+for dependency in jq busybox; do
+    command -v "$dependency" >/dev/null 2>&1 || {
+        echo "Error: functional tests require '$dependency'; see README.md (Development)." >&2
+        exit 1
+    }
+done
+if ! busybox httpd --help >/dev/null 2>&1; then
+    echo "Error: functional tests require BusyBox with httpd (e.g. busybox-static)." >&2
+    exit 1
+fi
+
 HTTPPORT=8990
 GOOD_PORT=8991
 REVOKED_PORT=8992
@@ -23,6 +34,7 @@ pids=()
 
 cleanup() {
     for pid in "${pids[@]:-}"; do kill "$pid" >/dev/null 2>&1 || true; done
+    for pid in "${pids[@]:-}"; do wait "$pid" >/dev/null 2>&1 || true; done
     rm -rf "$PKI_DIR"
 }
 trap cleanup EXIT
@@ -31,15 +43,14 @@ start_server() {
     local port=$1 cert=$2 chain=${3:-}
     local key="${cert/\/certs\//\/private\/}"
     key="${key%.pem}.key"
-    local -a args=(-accept "$port" -cert "$cert" -key "$key" -naccept 20 -quiet)
+    local -a args=(-accept "127.0.0.1:$port" -cert "$cert" -key "$key" -naccept 20 -quiet)
     [[ -n "$chain" ]] && args+=(-cert_chain "$chain")
     openssl s_server "${args[@]}" >"$PKI_DIR/s_server-$port.log" 2>&1 &
     pids+=($!)
 }
 
-(cd "$PKI_DIR/www" && python3 -m http.server "$HTTPPORT" >"$PKI_DIR/httpd.log" 2>&1 &)
-httpd_pid=$(pgrep -f "http.server $HTTPPORT" | tail -1)
-pids+=("$httpd_pid")
+busybox httpd -f -p "127.0.0.1:$HTTPPORT" -h "$PKI_DIR/www" -c /dev/null >"$PKI_DIR/httpd.log" 2>&1 &
+pids+=("$!")
 
 # leaf-good served with its full chain (intermediate)
 start_server "$GOOD_PORT" "$PKI_DIR/certs/leaf-good.pem" "$PKI_DIR/chain-good.pem"
@@ -81,9 +92,11 @@ check_exit() {
 
 check_exit "leaf-good: full chain presented -> VALID" 0 \
     "$check" --ca-file "$PKI_DIR/certs/root.pem" 127.0.0.1 "$GOOD_PORT"
+sed -n '/^FINAL STATUS$/,$p' /tmp/functest.out > "$PKI_DIR/good-final.txt"
 
 check_exit "leaf-revoked: full chain presented -> REVOKED" 2 \
     "$check" --ca-file "$PKI_DIR/certs/root.pem" 127.0.0.1 "$REVOKED_PORT"
+sed -n '/^FINAL STATUS$/,$p' /tmp/functest.out > "$PKI_DIR/revoked-final.txt"
 
 check_exit "leaf3: fine itself, but issuing intermediate2 is revoked -> REVOKED" 2 \
     "$check" --ca-file "$PKI_DIR/certs/root.pem" 127.0.0.1 "$LEAF3_PORT"
@@ -120,6 +133,10 @@ cat > "$PKI_DIR/hosts.txt" <<EOF
 EOF
 check_exit "batch mode: mixed good+revoked hosts -> exit 1" 1 \
     "$check" --ca-file "$PKI_DIR/certs/root.pem" --hosts-file "$PKI_DIR/hosts.txt"
+{
+    echo
+    sed -n '/^BATCH SUMMARY /,$p' /tmp/functest.out
+} > "$PKI_DIR/batch-summary.txt"
 
 # --parallel N: same aggregate result whether sequential (1) or concurrent (3),
 # with a repeated host list so real parallelism actually kicks in.
@@ -148,6 +165,88 @@ else
     echo "FAIL: --parallel 1 grouped summary counts are wrong"
     fail=$((fail + 1))
 fi
+
+assert_output() {
+    local desc=$1
+    shift
+    if "$@"; then
+        echo "PASS: $desc"
+        pass=$((pass + 1))
+    else
+        echo "FAIL: $desc"
+        fail=$((fail + 1))
+    fi
+}
+
+json_matches() {
+    jq -e -s "$1" "$2" >/dev/null
+}
+
+# Compare the entire concise output with the corresponding portion of the
+# full report: this catches leaked progress, tree output, and lost fields.
+check_exit "--summary-only: good leaf keeps exit 0" 0 \
+    "$check" --summary-only --ca-file "$PKI_DIR/certs/root.pem" 127.0.0.1 "$GOOD_PORT"
+assert_output "single-host summary exactly matches the full report's final status" \
+    cmp -s "$PKI_DIR/good-final.txt" /tmp/functest.out
+assert_output "single-host summary suppresses diagnostics" test ! -s /tmp/functest.err
+
+check_exit "--summary-only: revoked leaf keeps exit 2" 2 \
+    "$check" --summary-only --ca-file "$PKI_DIR/certs/root.pem" 127.0.0.1 "$REVOKED_PORT"
+assert_output "revoked summary exactly matches the full report's final status" \
+    cmp -s "$PKI_DIR/revoked-final.txt" /tmp/functest.out
+assert_output "revoked summary suppresses diagnostics" test ! -s /tmp/functest.err
+
+for parallel in 1 3; do
+    check_exit "--summary-only --parallel $parallel: mixed batch keeps exit 1" 1 \
+        "$check" --summary-only --parallel "$parallel" --ca-file "$PKI_DIR/certs/root.pem" \
+        --hosts-file "$PKI_DIR/hosts.txt"
+    assert_output "batch summary ($parallel workers) contains only the unchanged table" \
+        cmp -s "$PKI_DIR/batch-summary.txt" /tmp/functest.out
+    assert_output "batch summary ($parallel workers) suppresses diagnostics" test ! -s /tmp/functest.err
+done
+
+# The HTTP fixture cannot negotiate TLS, giving a deterministic early error.
+check_exit "--summary-only: connection error remains visible and exits 3" 3 \
+    "$check" --summary-only --connect-timeout 1 --connect-retries 0 127.0.0.1 "$HTTPPORT"
+assert_output "connection error has a final status" grep -qx 'FINAL STATUS' /tmp/functest.out
+assert_output "connection error is not mistaken for an invalid certificate" \
+    grep -qx '  TRUST: UNKNOWN' /tmp/functest.out
+assert_output "connection error overall status" grep -qx '  OVERALL: ERROR' /tmp/functest.out
+assert_output "connection error includes the failure reason" \
+    grep -q '^  REASON: unable to connect' /tmp/functest.out
+assert_output "connection error summary suppresses diagnostics" test ! -s /tmp/functest.err
+
+check_exit "JSON baseline: good leaf" 0 \
+    "$check" --json --ca-file "$PKI_DIR/certs/root.pem" 127.0.0.1 "$GOOD_PORT"
+cp /tmp/functest.out "$PKI_DIR/good.json"
+check_exit "--json --summary-only: good leaf" 0 \
+    "$check" --json --summary-only --ca-file "$PKI_DIR/certs/root.pem" 127.0.0.1 "$GOOD_PORT"
+assert_output "summary flag preserves the full JSON record, including warnings" \
+    cmp -s "$PKI_DIR/good.json" /tmp/functest.out
+assert_output "JSON summary suppresses diagnostics" test ! -s /tmp/functest.err
+
+check_exit "--summary-only --json: parallel mixed batch keeps exit 1" 1 \
+    "$check" --summary-only --json --parallel 3 --ca-file "$PKI_DIR/certs/root.pem" \
+    --hosts-file "$PKI_DIR/hosts.txt"
+assert_output "JSON batch contains exactly one complete record per host" \
+    json_matches '
+        length == 2
+        and (map([.overall, .exit_code]) | sort == [["REVOKED", 2], ["VALID", 0]])
+        and all(.[];
+            (.warnings | type == "array" and length > 0)
+            and (.reason | type == "string" and length > 0))
+    ' /tmp/functest.out
+assert_output "JSON batch summary suppresses diagnostics" test ! -s /tmp/functest.err
+
+check_exit "--summary-only --json: connection error keeps its error record" 3 \
+    "$check" --summary-only --json --connect-timeout 1 --connect-retries 0 127.0.0.1 "$HTTPPORT"
+assert_output "JSON error record remains parseable and includes the reason" \
+    json_matches '
+        length == 1
+        and (.[0] | .overall == "ERROR" and .exit_code == 3
+            and (.error | type == "string" and length > 0))
+    ' /tmp/functest.out
+assert_output "JSON connection error summary suppresses diagnostics" test ! -s /tmp/functest.err
 
 echo
 echo "Functional tests: $pass passed, $fail failed."

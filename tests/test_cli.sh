@@ -23,8 +23,9 @@ expect_exit() {
 
 expect_exit 0 "$script" --help
 grep -q -- '--json' "$scratch/stdout"
+grep -q -- '--summary-only' "$scratch/stdout"
 expect_exit 0 "$script" --version
-grep -q '^checkCRT.sh 1\.10\.1$' "$scratch/stdout"
+grep -q '^checkCRT.sh 1\.11\.0$' "$scratch/stdout"
 expect_exit 1 "$script" --connect-timeout 0 example.com
 grep -q 'positive number' "$scratch/stderr"
 expect_exit 1 "$script" --ca-file "$scratch/missing.pem" example.com
@@ -40,5 +41,7 @@ expect_exit 1 "$script" --parallel 0 example.com
 grep -q 'positive integer' "$scratch/stderr"
 expect_exit 1 "$script" --parallel not-a-number example.com
 grep -q 'positive integer' "$scratch/stderr"
+expect_exit 1 "$script" --summary-only --connect-timeout 0 example.com
+grep -q 'positive number' "$scratch/stderr"
 
 echo 'CLI regression tests passed.'

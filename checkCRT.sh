@@ -9,11 +9,12 @@
 
 set -u -o pipefail
 
-VERSION=1.10.1
+VERSION=1.11.0
 verify_peer=1
 ca_file=
 ca_path=
 output_format=text
+summary_only=0
 connect_timeout=5
 request_timeout=20
 connect_retries=4
@@ -42,6 +43,8 @@ Options:
   --ca-path DIR       Directory of hashed CA certificates for verification.
   --json              Write the final status as JSON to standard output
                       (one object per host, newline-delimited in batch mode).
+  --summary-only      Show only FINAL STATUS (single host) or BATCH SUMMARY
+                      (hosts file). With --json, suppress diagnostics.
   --connect-timeout N TLS connection timeout in seconds (default: 5).
   --request-timeout N CRL/OCSP request timeout in seconds (default: 20).
   --connect-retries N Retry a failed network operation (initial TLS
@@ -56,7 +59,7 @@ Options:
                       imap, pop3, ftp, nntp, ldap, xmpp, postgres, mysql).
                       Applies to every host checked.
   --expiry-warn-days N Warn when the certificate expires within N days
-                      (default: 30; 0 disables the warning).
+                      (default: 14; 0 disables the warning).
   --fail-on-expiry-warning
                       Exit 6 instead of 0 when only the expiry warning
                       applies (chain trusted, not revoked, not expired).
@@ -83,6 +86,7 @@ while (( $# > 0 )); do
         --version) printf '%s %s\n' "${0##*/}" "$VERSION"; exit 0 ;;
         --verify-peer) verify_peer=1 ;;
         --json) output_format=json ;;
+        --summary-only) summary_only=1 ;;
         --no-caa) check_caa=0 ;;
         --fail-on-expiry-warning) fail_on_expiry_warning=1 ;;
         --connect-timeout|--request-timeout|--connect-retries|--retry-delay|--max-ocsp-age|--clock-skew|--proxy|--no-proxy|--ca-path|--starttls|--expiry-warn-days|--hosts-file|--parallel)
@@ -191,6 +195,11 @@ fi
 # progress and diagnostic output continues on standard error. In --hosts-file
 # mode each host writes one JSON object, so stdout becomes newline-delimited
 # JSON (NDJSON) rather than a single JSON array.
+if (( summary_only == 1 )) && [[ "$output_format" == text ]]; then
+    # Keep the final single-host report visible while check_host suppresses
+    # progress and diagnostics. Batch reports use the parent's normal stdout.
+    exec 4>&1
+fi
 if [[ "$output_format" == json ]]; then
     exec 3>&1
     exec 1>&2
@@ -246,15 +255,37 @@ json_escape() {
     printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e ':a' -e 'N' -e '$!ba' -e 's/\n/\\n/g'
 }
 
+print_final_status() {
+    local report_fd=1
+    if (( summary_only == 1 )); then
+        [[ -n "$hosts_file" ]] && return 0
+        report_fd=4
+    fi
+    {
+        echo "FINAL STATUS"
+        printf '  ISSUER: %s\n' "${1:-unknown}"
+        printf '  TRUST: %s\n' "$2"
+        printf '  REVOCATION: %s\n' "$3"
+        printf '  EXPIRY: %s\n' "$4"
+        printf '  DAYS REMAINING: %s\n' "${5:-N/A}"
+        printf '  OVERALL: %s\n' "$6"
+        printf '  REASON: %s\n' "$7"
+    } >&"$report_fd"
+}
+
 # Emits a JSON record for a host that failed before a full check could be
 # completed (e.g. connection failure), so --json/--hosts-file consumers see
 # one line per host attempted instead of that host silently disappearing.
+# In text summary mode, also render the error as the final single-host report.
 emit_error_json() {
     local err_domain=$1 err_port=$2 message=$3
     batch_overall=ERROR
     batch_reason=$message
     batch_issuer=
     batch_days_left=
+    if (( summary_only == 1 )) && [[ "$output_format" == text ]]; then
+        print_final_status '' UNKNOWN UNKNOWN UNKNOWN '' ERROR "$message"
+    fi
     [[ "$output_format" == json ]] || return 0
     printf '{"host":"%s","port":%s,"issuer":null,"trust":null,"revocation":null,"expiry":null,"expiry_days_left":null,"intermediate_revoked":null,"stapled_ocsp":null,"overall":"ERROR","reason":"%s","exit_code":3,"warnings":[],"error":"%s"}\n' \
         "$(json_escape "$err_domain")" "$err_port" "$(json_escape "$message")" "$(json_escape "$message")" >&3
@@ -415,7 +446,7 @@ check_certificate_revocation() {
 
 # Runs the full check for one host:port and returns the exit code (does not
 # call exit itself, so --hosts-file can check many hosts in one process).
-check_host() {
+check_host_details() {
     local domain=$1 port=$2
     if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
         echo "Error: port must be between 1 and 65535 (got '$port' for host '$domain')." >&2
@@ -1047,16 +1078,20 @@ check_host() {
             "$(if (( intermediate_revoked == 1 )); then echo true; else echo false; fi)" \
             "$(json_escape "$stapled_ocsp")" "$(json_escape "$overall_status")" "$(json_escape "$reason")" "$exit_code" "$warnings_json" >&3
     else
-        echo "FINAL STATUS"
-        printf '  ISSUER: %s\n' "${issuer_cn:-unknown}"
-        printf '  TRUST: %s\n' "$trust_status"
-        printf '  REVOCATION: %s\n' "$revocation_status"
-        printf '  EXPIRY: %s\n' "$expiry_status"
-        printf '  DAYS REMAINING: %s\n' "${expiry_days_left:-N/A}"
-        printf '  OVERALL: %s\n' "$overall_status"
-        printf '  REASON: %s\n' "$reason"
+        print_final_status "$issuer_cn" "$trust_status" "$revocation_status" \
+            "$expiry_status" "$expiry_days_left" "$overall_status" "$reason"
     fi
     return "$exit_code"
+}
+
+check_host() {
+    # Redirection does not spawn a subshell: the caller still receives the
+    # same batch result variables and exit code. JSON uses its saved fd 3.
+    if (( summary_only == 1 )); then
+        check_host_details "$@" >/dev/null 2>&1
+    else
+        check_host_details "$@"
+    fi
 }
 
 if [[ -n "$hosts_file" ]]; then
@@ -1086,10 +1121,12 @@ if [[ -n "$hosts_file" ]]; then
         for job_idx in "${!job_hosts[@]}"; do
             batch_host=${job_hosts[$job_idx]}
             batch_port=${job_ports[$job_idx]}
-            echo
-            echo "############################################################"
-            echo "### ${batch_host}:${batch_port}"
-            echo "############################################################"
+            if (( summary_only == 0 )); then
+                echo
+                echo "############################################################"
+                echo "### ${batch_host}:${batch_port}"
+                echo "############################################################"
+            fi
             batch_overall=
             batch_reason=
             batch_issuer=
@@ -1107,10 +1144,12 @@ if [[ -n "$hosts_file" ]]; then
             job_results[job_idx]=$(mktemp "$workdir/batch-res.XXXXXX")
             (
                 {
-                    echo
-                    echo "############################################################"
-                    echo "### ${batch_host}:${batch_port}"
-                    echo "############################################################"
+                    if (( summary_only == 0 )); then
+                        echo
+                        echo "############################################################"
+                        echo "### ${batch_host}:${batch_port}"
+                        echo "############################################################"
+                    fi
                     batch_overall=
                     batch_reason=
                     batch_issuer=
@@ -1138,7 +1177,7 @@ if [[ -n "$hosts_file" ]]; then
         wait
 
         for job_idx in "${!job_hosts[@]}"; do
-            cat "${job_logs[$job_idx]}"
+            if (( summary_only == 0 )); then cat "${job_logs[$job_idx]}"; fi
             batch_rc=
             batch_overall=
             batch_reason=
@@ -1185,11 +1224,11 @@ if [[ -n "$hosts_file" ]]; then
 
         # Column widths: HOST/STATUS/ISSUER/DAYS LEFT/REASON size to their
         # widest value, but ISSUER and REASON are capped (longer values are
-        # shown truncated with an ellipsis) so one long entry can't blow up
+        # shown truncated with an ellipsis) so one long entry cannot blow up
         # the whole table or wrap the terminal line; run the single host (or
         # use --json) for the untruncated reason.
-        batch_issuer_cap=42
-        batch_reason_cap=60
+        batch_issuer_cap=52
+        batch_reason_cap=72
         declare -a batch_issuer_disp=() batch_reason_disp=()
         batch_host_w=4
         batch_status_w=6

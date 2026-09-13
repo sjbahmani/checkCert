@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.11.0
+
+- Added `--summary-only`: show just `FINAL STATUS` for a single host or
+  `BATCH SUMMARY` for a hosts file, including sequential and parallel runs.
+- Combine it with `--json` to suppress per-host diagnostics while retaining
+  complete JSON/NDJSON records. Checks and exit codes are unchanged; failed
+  single-host checks still show an error summary and reason.
+- Functional tests use `jq` for JSON assertions and `busybox httpd` for the
+  local HTTP fixture, removing their Python dependency. Test dependencies are
+  documented in the README and installed by CI.
+
+## 1.10.2
+
+- Corrected the documented `--expiry-warn-days` default to 14 days, matching
+  the script's behavior.
+- Corrected the batch-summary documentation to state that `REASON` is
+  truncated after 60 characters; the README example now includes the
+  `DAYS LEFT` column emitted by the script.
+
 ## 1.10.1
 
 - `BATCH SUMMARY` rows are now alphabetized by host within each status group (previously input-file order).
@@ -48,7 +67,7 @@
 ## 1.3.0
 
 - Added `--starttls PROTO` for SMTP/IMAP/POP3/FTP/LDAP/XMPP/etc. services that upgrade to TLS.
-- Added an expiry-warning threshold (`--expiry-warn-days`, default 30) and `expiry_days_left` in JSON output; `EXPIRY` can now report `EXPIRING SOON`.
+- Added an expiry-warning threshold (`--expiry-warn-days`, default 14) and `expiry_days_left` in JSON output; `EXPIRY` can now report `EXPIRING SOON`.
 - Added non-fatal advisory checks for weak TLS protocol/cipher, weak certificate signature algorithm, undersized public keys, missing serverAuth EKU, and Certificate Transparency SCT presence, surfaced in a new `ADVISORY WARNINGS` section and JSON `warnings` array.
 - Added DNS CAA record lookup (`--no-caa` to disable) using `dig`, `host`, or `nslookup`.
 - LDAP CRL and AIA issuer URLs are now detected and skipped with a clear message instead of silently failing to fetch.

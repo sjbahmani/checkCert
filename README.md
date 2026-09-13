@@ -27,6 +27,8 @@ lookup is skipped, not fatal, when none are installed.
 ./checkCRT.sh --expiry-warn-days 14 example.com
 ./checkCRT.sh --no-caa internal.example
 ./checkCRT.sh --hosts-file hosts.txt
+./checkCRT.sh --summary-only example.com
+./checkCRT.sh --summary-only --hosts-file hosts.txt
 ```
 
 The script always validates the chain and the supplied hostname (or IP address)
@@ -57,6 +59,19 @@ messages are written to standard error. This makes it suitable for monitoring:
 ```json
 {"host":"example.com","port":443,"issuer":"CN=WE2,O=Google Trust Services,C=US","trust":"TRUSTED","revocation":"NOT REVOKED","expiry":"NOT EXPIRED","expiry_days_left":46,"intermediate_revoked":false,"stapled_ocsp":"NOT STAPLED","overall":"VALID","exit_code":0,"warnings":[]}
 ```
+
+Use `--summary-only` to hide certificate details, the CA tree, progress, and
+diagnostics. A single-host check prints only `FINAL STATUS`; a hosts-file
+check prints only `BATCH SUMMARY`, in both sequential and parallel modes.
+All checks and exit codes stay the same, and the batch table keeps its existing
+issuer and reason truncation.
+
+With `--json --summary-only`, standard output still contains the complete
+JSON/NDJSON records (including warnings and failure reasons), but per-host
+diagnostics on standard error are suppressed. Invalid command-line arguments
+and startup errors are still reported. If a single-host check cannot complete,
+the text summary reports `OVERALL: ERROR`, `UNKNOWN` check statuses, and the
+failure reason (exit 3).
 
 ## Batch mode
 
@@ -94,15 +109,16 @@ code:
 ```text
 BATCH SUMMARY (4 host(s) checked)
 
-  STATUS   HOST            ISSUER                                      REASON
-  -------  --------------  ------------------------------------------  ------
-  REVOKED  bmi.ir:443      CN=Certum OV TLS G2 R39 CA,O=Asseco Data …  leaf certificate is revoked
-  VALID    example.com:443 CN=WE2,O=Google Trust Services,C=US         trusted, not revoked, not expiring soon
+  STATUS   HOST            ISSUER                                      DAYS LEFT  REASON
+  -------  --------------  ------------------------------------------  ---------  ------
+  REVOKED  bmi.ir:443      CN=Certum OV TLS G2 R39 CA,O=Asseco Data …        42  leaf certificate is revoked
+  VALID    example.com:443 CN=WE2,O=Google Trust Services,C=US               46  trusted, not revoked, not expiring soon
   ...
 ```
 
-The `ISSUER` column is truncated with `…` past 42 characters to keep the
-table readable; `REASON` is never truncated.
+The `ISSUER` column is truncated with `…` past 42 characters and `REASON`
+past 60 characters to keep the table readable. Run a single-host check or use
+`--json` to obtain the complete reason.
 
 ## STARTTLS
 
@@ -118,7 +134,7 @@ Supported values come from the local OpenSSL build's `s_client -starttls`
 Beyond trust/expiry/revocation, every run also reports and collects into a
 non-fatal `ADVISORY WARNINGS` list (and the JSON `warnings` array):
 
-- **Expiry warning** — `--expiry-warn-days N` (default 30; `0` disables it)
+- **Expiry warning** — `--expiry-warn-days N` (default 14; `0` disables it)
   flags certificates expiring soon. `EXPIRY` can now report `EXPIRING SOON` in
   addition to `NOT EXPIRED`/`EXPIRED`. By default this does not change the
   exit code; pass `--fail-on-expiry-warning` to exit `6` instead of `0` for
@@ -260,6 +276,17 @@ the local system store.
 
 ## Development
 
+Tests additionally require `jq` for JSON/NDJSON assertions and BusyBox with the
+`httpd` applet for the local HTTP fixture. Install ShellCheck for linting too.
+On Debian/Ubuntu:
+
+```bash
+sudo apt-get install jq busybox-static shellcheck
+```
+
+These are development dependencies; running `checkCRT.sh` does not require
+`jq` or BusyBox. The test suite does not require Python.
+
 ```bash
 bash -n checkCRT.sh
 shellcheck -s bash checkCRT.sh
@@ -269,7 +296,7 @@ shellcheck -s bash checkCRT.sh
 
 `tests/functional/run.sh` builds a disposable root CA, two intermediates, and
 three leaves (see `tests/functional/setup_pki.sh`), serves them over local
-`openssl s_server`/`http.server` instances on 127.0.0.1, and asserts
+`openssl s_server`/`busybox httpd` instances on 127.0.0.1, and asserts
 `checkCRT.sh`'s exit code and output for: a valid chain, a revoked leaf, a
 revoked intermediate (with an otherwise-fine leaf), a server that omits its
 intermediate (regression test for AIA-based chain recovery), and

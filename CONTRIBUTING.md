@@ -6,6 +6,10 @@ status handling, option parsing, revocation/trust logic, or output format
 
 ## Before opening a pull request
 
+Install the test dependencies listed in the README: `jq` for JSON assertions,
+BusyBox with `httpd` (e.g. `busybox-static`) for the HTTP fixture, and ShellCheck
+for linting. Python is not required.
+
 Run the full check locally — this is exactly what CI (`.github/workflows/ci.yml`)
 runs on every push and pull request:
 
@@ -24,7 +28,7 @@ errors — CI fails on warnings too).
 - **`tests/functional/run.sh`** — end-to-end checks against a local,
   disposable PKI (`tests/functional/setup_pki.sh` builds a throwaway root CA,
   two intermediates, and several leaves) served over `openssl s_server` and a
-  local `http.server` on `127.0.0.1`. It exercises revocation (leaf and
+  local `busybox httpd` on `127.0.0.1`. It exercises revocation (leaf and
   intermediate), the AIA chain-recovery path, the OCSP-stapling retry
   fallback, and `--hosts-file` batch mode (both sequential and parallel),
   asserting exit codes and specific output. It makes no real network
