@@ -9,7 +9,7 @@
 
 set -u -o pipefail
 
-VERSION=1.14.2
+VERSION=1.14.3
 verify_peer=1
 ca_file=
 ca_path=
@@ -443,7 +443,8 @@ crl_is_current() {
     last_epoch=$(date -u -d "$last_update" +%s 2>/dev/null) || return 1
     next_epoch=$(date -u -d "$next_update" +%s 2>/dev/null) || return 1
     now=$(date -u +%s)
-    (( last_epoch <= now + clock_skew && next_epoch > now - clock_skew ))
+    # Skew tolerates clock differences, never an empty or reversed interval.
+    (( next_epoch > last_epoch && last_epoch <= now + clock_skew && next_epoch > now - clock_skew ))
 }
 
 # Cache entries are evidence, never trust anchors or cached verdicts. Validate

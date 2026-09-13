@@ -132,12 +132,12 @@ runs, choose a persistent directory:
   is also supplied, and does not create that directory.
 
 Each cache hit is revalidated. A CRL must verify against the certificate's
-actual issuer, have a usable update period, and still be before `nextUpdate`;
-clock-skew tolerance never extends its cache lifetime. An AIA certificate
-must match the expected issuer and verify the leaf. The normal trust-store,
-identity, expiry, and revocation checks still run: cached issuers are **not**
-added to the trust store, and a CRL is checked separately against every
-certificate's serial number. Whole-host verdicts are never cached.
+actual issuer, have `nextUpdate` strictly after `lastUpdate`, and still be
+before `nextUpdate`; clock-skew tolerance never extends its cache lifetime.
+An AIA certificate must match the expected issuer and verify the leaf. The
+normal trust-store, identity, expiry, and revocation checks still run: cached
+issuers are **not** added to the trust store, and a CRL is checked separately
+against every certificate's serial number. Whole-host verdicts are never cached.
 
 OCSP caching saves the signed response bytes, not just a `good`/`revoked`
 string. Keys include the responder URL and the certificate and issuer

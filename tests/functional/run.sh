@@ -459,6 +459,41 @@ check_exit "cached CRL with a future lastUpdate is rejected" 3 \
     "$check" "${cache_args[@]}" --cache-dir "$persistent_cache" --summary-only 127.0.0.1 "$GOOD_PORT"
 
 rm -f "$CHECKCRT_TEST_OFFLINE"
+# Clock skew must not make an empty or reversed signed interval usable.
+cp "$PKI_DIR/www/intermediate.crl" "$PKI_DIR/valid-period.crl"
+for period in reversed empty; do
+    period_now=$(date -u +%s)
+    period_last=$((period_now + 240))
+    period_next=$((period_now + 120))
+    [[ "$period" != empty ]] || period_last=$period_next
+    openssl ca -config "$PKI_DIR/ca_intermediate.cnf" -gencrl \
+        -crl_lastupdate "$(date -u -d "@$period_last" +%Y%m%d%H%M%SZ)" \
+        -crl_nextupdate "$(date -u -d "@$period_next" +%Y%m%d%H%M%SZ)" \
+        -out "$PKI_DIR/$period.crl" >/dev/null 2>&1 || exit 1
+    seed_cache "$cached_crl" "$PKI_DIR/$period.crl"
+    touch "$CHECKCRT_TEST_OFFLINE"
+    : > "$CHECKCRT_TEST_FETCH_LOG"
+    check_exit "cached CRL with $period update period stays UNKNOWN during outage" 3 \
+        "$check" "${cache_args[@]}" --cache-dir "$persistent_cache" --json 127.0.0.1 "$GOOD_PORT"
+    assert_output "$period cached period triggers a real refresh attempt" fetch_count_is 1
+    assert_output "$period cached period cannot supply revocation evidence" \
+        json_matches 'length == 1 and .[0].revocation == "UNKNOWN"' /tmp/functest.out
+    rm -f "$CHECKCRT_TEST_OFFLINE"
+    : > "$CHECKCRT_TEST_FETCH_LOG"
+    check_exit "cached CRL with $period update period is refreshed" 0 \
+        "$check" "${cache_args[@]}" --cache-dir "$persistent_cache" 127.0.0.1 "$GOOD_PORT"
+    assert_output "$period cached period requires a new download" fetch_count_is 1
+
+    cp "$PKI_DIR/$period.crl" "$PKI_DIR/www/intermediate.crl"
+    check_exit "downloaded CRL with $period update period is rejected" 3 \
+        "$check" "${cache_args[@]}" --cache-dir "$PKI_DIR/$period-cache" 127.0.0.1 "$GOOD_PORT"
+    period_entries=("$PKI_DIR/$period-cache"/*.pem)
+    assert_output "$period downloaded period leaves no cache entry" test ! -e "${period_entries[0]}"
+    check_exit "CRL with $period update period is rejected with --no-cache" 3 \
+        "$check" "${cache_args[@]}" --no-cache 127.0.0.1 "$GOOD_PORT"
+    cp "$PKI_DIR/valid-period.crl" "$PKI_DIR/www/intermediate.crl"
+done
+
 openssl crl -in "$PKI_DIR/www/intermediate.crl" -badsig -out "$PKI_DIR/badsig.crl"
 printf 'not a CRL\n' > "$PKI_DIR/garbage.crl"
 for bad_crl in stale future badsig garbage; do

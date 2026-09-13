@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.14.3
+
+- Reject signed CRLs whose `nextUpdate` is at or before `lastUpdate`, even
+  when both timestamps fall within clock-skew tolerance. Apply this to cache
+  hits and fresh downloads so an invalid update period cannot supply
+  revocation evidence or populate the cache.
+- Add regressions for invalid update periods, failed cache refreshes, and
+  checks with caching disabled.
+
 ## 1.14.2
 
 - Fix `crl_signature_is_valid()` to accept a `verify OK` line anywhere in
