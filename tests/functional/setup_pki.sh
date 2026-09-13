@@ -35,6 +35,27 @@ openssl req -x509 -new -key private/root.key -sha256 -days 3650 \
     -addext "keyUsage=critical,keyCertSign,cRLSign" \
     -out certs/root.pem >/dev/null 2>&1
 
+# A cross-signed copy of the trusted root whose actual issuer is deliberately
+# omitted from the server chain and trust store. Its CRL cannot be verified.
+openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 3650 \
+    -subj "/O=checkCRT Test/CN=Unavailable Legacy Root" \
+    -addext "basicConstraints=critical,CA:true" \
+    -addext "keyUsage=critical,keyCertSign,cRLSign" \
+    -keyout private/legacy-root.key -out certs/legacy-root.pem >/dev/null 2>&1
+openssl req -new -key private/root.key \
+    -subj "/O=checkCRT Test/CN=checkCRT Test Root CA" \
+    -out root-cross.csr >/dev/null 2>&1
+cat > root_cross_ext.cnf <<EOF
+basicConstraints=critical,CA:true
+keyUsage=critical,keyCertSign,cRLSign
+authorityKeyIdentifier=keyid:always
+subjectKeyIdentifier=hash
+crlDistributionPoints=URI:http://127.0.0.1:${HTTPPORT}/unavailable-root.crl
+EOF
+openssl x509 -req -in root-cross.csr -CA certs/legacy-root.pem \
+    -CAkey private/legacy-root.key -CAcreateserial -days 1825 -sha256 \
+    -extfile root_cross_ext.cnf -out certs/root-cross.pem >/dev/null 2>&1
+
 # --- Intermediate CA (signs leaf-good, leaf-revoked) ---
 openssl genrsa -out private/intermediate.key 2048 >/dev/null 2>&1
 openssl req -new -key private/intermediate.key \
@@ -184,6 +205,7 @@ cp certs/intermediate.pem www/intermediate.crt
 
 # --- Chain bundles for s_server -cert_chain ---
 cat certs/intermediate.pem > chain-good.pem
+cat certs/intermediate.pem certs/root-cross.pem > chain-cross.pem
 cat certs/intermediate2.pem certs/root.pem > chain3.pem
 
 echo "PKI ready: $PKI_DIR" >&2

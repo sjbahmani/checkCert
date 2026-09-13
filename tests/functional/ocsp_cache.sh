@@ -87,6 +87,8 @@ retime() { sed "1c# checkCRT-cache-v1 $3" "$1" > "$2"; }
 check_exit 'OCSP cold cache verifies leaf and intermediate' 0 \
     "$check" "${args[@]}" --cache-dir "$cache" --json 127.0.0.1 "$good_port"
 assert 'two actual HTTP requests populate the cache' requests 2
+assert 'cold OCSP metrics count both downloaded responses' \
+    json_matches '.[0].cache_hits == 0 and .[0].cache_misses == 2 and .[0].elapsed_seconds >= 0'
 assert 'OCSP cache miss is logged outside JSON' grep -q 'Cache MISS (OCSP): NOT USED' "$err"
 assert 'OCSP-only JSON result is trusted and not revoked' \
     json_matches 'length == 1 and (.[0] | .trust == "TRUSTED" and .revocation == "NOT REVOKED")'
@@ -98,6 +100,8 @@ set_mode offline
 check_exit 'warm OCSP cache works during responder outage' 0 \
     "$check" "${args[@]}" --cache-dir "$cache" --json 127.0.0.1 "$good_port"
 assert 'warm OCSP cache avoids all HTTP requests' requests 0
+assert 'warm OCSP metrics count both reused responses' \
+    json_matches '.[0].cache_hits == 2 and .[0].cache_misses == 0'
 assert 'OCSP cache hits are logged' grep -q 'Cache HIT (OCSP): USED' "$err"
 assert 'cache hits do not reset timestamps' cmp -s "$fixture_dir/good.saved" "$cache/$good_entry"
 check_exit 'OCSP cache never makes an untrusted chain trusted' 5 \
@@ -172,7 +176,7 @@ for mode in unknown badsig wrong-id wrong-signer; do
 done
 
 set_mode offline
-retime "$fixture_dir/good.saved" "$cache/$good_entry" "$(( $(date -u +%s) - 15000 ))"
+retime "$fixture_dir/good.saved" "$cache/$good_entry" "$(( $(date -u +%s) - 90000 ))"
 check_exit 'expired OCSP cache TTL never falls back during outage' 3 \
     "$check" "${args[@]}" --cache-dir "$cache" 127.0.0.1 "$good_port"
 assert 'expired cached response triggers a real refresh attempt' requests 1
@@ -211,6 +215,54 @@ retime "$fixture_dir/issuer.saved" "$cache/$issuer_entry" "$(( $(date -u +%s) - 
 check_exit 'signed thisUpdate in the future is rejected despite a valid download timestamp' 3 \
     env PATH="$fixture_dir/bin:$PATH" CHECKCRT_CLOCK_OFFSET=-1800 \
     "$check" "${args[@]}" --cache-dir "$cache" 127.0.0.1 "$good_port"
+
+# A CA response may outlive the leaf's one-day age limit, but its signed
+# deadline, download TTL, and an explicit operator age cap still apply.
+for ca_mode in dynamic no-next; do
+    set_mode "$ca_mode"
+    ca_cache="$fixture_dir/aged-ca-$ca_mode"
+    check_exit "populate $ca_mode responses for CA age-policy checks" 0 \
+        "$check" "${args[@]}" --cache-dir "$ca_cache" 127.0.0.1 "$good_port"
+    set_mode offline
+    check_exit "aged $ca_mode responses keep the leaf one-day limit" 3 \
+        env PATH="$fixture_dir/bin:$PATH" CHECKCRT_CLOCK_OFFSET=90000 \
+        "$check" "${args[@]}" --cache-max-age 259200 --cache-dir "$ca_cache" --json 127.0.0.1 "$good_port"
+    assert "aged $ca_mode leaf remains UNKNOWN" json_matches '.[0].revocation == "UNKNOWN"'
+    if [[ "$ca_mode" == dynamic ]]; then
+        assert 'CA with a signed nextUpdate is reused after one day' requests 1
+        assert 'CA reuse counts a hit while the stale leaf counts a miss' \
+            json_matches '.[0].cache_hits == 1 and .[0].cache_misses == 1'
+        for age_syntax in separate equals; do
+            set_mode offline
+            age_override=(--max-ocsp-age 86400)
+            [[ "$age_syntax" != equals ]] || age_override=(--max-ocsp-age=86400)
+            check_exit "explicit OCSP age limit still applies to CAs ($age_syntax)" 3 \
+                env PATH="$fixture_dir/bin:$PATH" CHECKCRT_CLOCK_OFFSET=90000 \
+                "$check" "${args[@]}" "${age_override[@]}" --cache-max-age 259200 --cache-dir "$ca_cache" 127.0.0.1 "$good_port"
+            assert "explicit age cap refreshes both leaf and CA ($age_syntax)" requests 2
+        done
+        set_mode offline
+        check_exit 'CA signed nextUpdate still expires within a longer cache TTL' 3 \
+            env PATH="$fixture_dir/bin:$PATH" CHECKCRT_CLOCK_OFFSET=173000 \
+            "$check" "${args[@]}" --cache-max-age 259200 --cache-dir "$ca_cache" 127.0.0.1 "$good_port"
+        assert 'expired CA response is refreshed instead of reused' requests 2
+        set_mode offline
+        check_exit 'CA reuse still obeys the default download TTL' 3 \
+            env PATH="$fixture_dir/bin:$PATH" CHECKCRT_CLOCK_OFFSET=90000 \
+            "$check" "${args[@]}" --cache-dir "$ca_cache" 127.0.0.1 "$good_port"
+        assert 'download TTL refreshes both objects even with a live CA nextUpdate' requests 2
+        set_mode dynamic
+        check_exit 'fresh query can cache an older CA response with a live nextUpdate' 3 \
+            env PATH="$fixture_dir/bin:$PATH" CHECKCRT_CLOCK_OFFSET=90000 \
+            "$check" "${args[@]}" --cache-dir "$ca_cache/fresh" 127.0.0.1 "$good_port"
+        assert 'fresh CA response is cached under its signed deadline' test -s "$ca_cache/fresh/$issuer_entry"
+        assert 'equally old leaf response is still not cached' test ! -e "$ca_cache/fresh/$good_entry"
+    else
+        assert 'CA without nextUpdate retains the one-day age limit' requests 2
+        assert 'no-nextUpdate responses supply no cache hits after one day' \
+            json_matches '.[0].cache_hits == 0 and .[0].cache_misses == 2'
+    fi
+done
 
 set_mode root-revoked
 check_exit 'OCSP detects a revoked intermediate with a good leaf' 2 \

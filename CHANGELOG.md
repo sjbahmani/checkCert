@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.15.0
+
+- Skip CRL downloads when the certificate's actual issuer is unavailable,
+  avoiding repeated unusable downloads and cache misses for cross-signed roots.
+  Report the missing issuer instead of a misleading signature failure.
+- Increase the default cache download TTL to 24 hours while retaining signed
+  freshness limits. Reduce retries to three extra attempts with a one-second delay.
+- Reduce the default connection timeout to 2 seconds and increase the request
+  timeout to 60 seconds so large CRL downloads have time to finish.
+- Accept long-lived CA OCSP responses until their signed `nextUpdate` by
+  default, fixing repeated misses for otherwise valid older CA responses.
+  Keep the one-day limit for leaf responses and CA responses without
+  `nextUpdate`; an explicit `--max-ocsp-age` limits all responses. Cache
+  download-age limits, signature verification, and certificate IDs still apply.
+- Report per-host elapsed seconds and cache hit/miss counts in `FINAL STATUS`,
+  including early errors and summary-only output. Combine days left, elapsed
+  time, and cache counts in one compact `DL TIME H/M` batch column, such as
+  `42 1.2s 3/1`.
+- Include numeric `elapsed_seconds`, `cache_hits`, and `cache_misses` in JSON
+  success and error records. Waiting for a shared download that is then reused
+  counts as a hit; disabled caching counts neither hits nor misses.
+- Normalize zero-padded ports as decimal and keep invalid-port error records
+  valid JSON, including their elapsed time and cache counts.
+
 ## 1.14.4
 
 - Eliminate duplicate CRL signature verification within each fetch and its

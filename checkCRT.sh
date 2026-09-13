@@ -9,7 +9,7 @@
 
 set -u -o pipefail
 
-VERSION=1.14.4
+VERSION=1.15.0
 verify_peer=1
 ca_file=
 ca_path=
@@ -21,12 +21,13 @@ connect_ip_json=null
 cache_enabled=1
 cache_dir=
 cache_dir_set=0
-cache_max_age=14400
-connect_timeout=5
-request_timeout=20
-connect_retries=4
-retry_delay=3
+cache_max_age=86400
+connect_timeout=2
+request_timeout=60
+connect_retries=3
+retry_delay=1
 max_ocsp_age=86400
+max_ocsp_age_set=0
 clock_skew=300
 proxy=
 no_proxy=
@@ -57,17 +58,19 @@ Options:
   --cache-dir DIR     Keep verified CRL/AIA/OCSP data between runs in a private
                       directory. By default, the cache lasts only this run.
                       Shared downloads wait for a per-object lock (uses flock).
-  --cache-max-age N   Maximum cached download age in seconds (default: 14400;
-                      4 hours).
+  --cache-max-age N   Maximum cached download age in seconds (default: 86400;
+                      24 hours).
                       CRL/OCSP entries are never reused past nextUpdate.
   --no-cache          Disable cache reads and writes, including --cache-dir.
-  --connect-timeout N TLS connection timeout in seconds (default: 5).
-  --request-timeout N CRL/OCSP request timeout in seconds (default: 20).
+  --connect-timeout N TLS connection timeout in seconds (default: 2).
+  --request-timeout N CRL/OCSP request timeout in seconds (default: 60).
   --connect-retries N Retry a failed network operation (initial TLS
                       connection, CRL download, or OCSP query) up to N
-                      extra times (default: 4; 0 disables retrying).
-  --retry-delay N     Seconds to wait between connection retries (default: 3).
-  --max-ocsp-age N    Maximum OCSP response age in seconds (default: 86400).
+                      extra times (default: 3; 0 disables retrying).
+  --retry-delay N     Seconds to wait between connection retries (default: 1).
+  --max-ocsp-age N    Maximum OCSP response age in seconds (default: 86400
+                      for leaf/no-nextUpdate responses). CA responses with
+                      nextUpdate use its signed deadline unless N is set.
   --clock-skew N      Allowed clock skew for OCSP in seconds (default: 300).
   --proxy URL         HTTP(S) proxy for CRL/OCSP HTTP requests.
   --no-proxy HOSTS    Comma-separated hosts that bypass the proxy.
@@ -124,7 +127,7 @@ while (( $# > 0 )); do
                 --request-timeout) request_timeout=$1 ;;
                 --connect-retries) connect_retries=$1 ;;
                 --retry-delay) retry_delay=$1 ;;
-                --max-ocsp-age) max_ocsp_age=$1 ;;
+                --max-ocsp-age) max_ocsp_age=$1; max_ocsp_age_set=1 ;;
                 --clock-skew) clock_skew=$1 ;;
                 --proxy) proxy=$1 ;;
                 --no-proxy) no_proxy=$1 ;;
@@ -155,7 +158,7 @@ while (( $# > 0 )); do
         --request-timeout=*) request_timeout=${1#--request-timeout=} ;;
         --connect-retries=*) connect_retries=${1#--connect-retries=} ;;
         --retry-delay=*) retry_delay=${1#--retry-delay=} ;;
-        --max-ocsp-age=*) max_ocsp_age=${1#--max-ocsp-age=} ;;
+        --max-ocsp-age=*) max_ocsp_age=${1#--max-ocsp-age=}; max_ocsp_age_set=1 ;;
         --clock-skew=*) clock_skew=${1#--clock-skew=} ;;
         --proxy=*) proxy=${1#--proxy=} ;;
         --no-proxy=*) no_proxy=${1#--no-proxy=} ;;
@@ -377,6 +380,26 @@ json_escape() {
     printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e ':a' -e 'N' -e '$!ba' -e 's/\n/\\n/g'
 }
 
+finish_host_metrics() {
+    local now elapsed_ns event
+    now=$(date +%s%N)
+    elapsed_ns=$((now - host_started_ns))
+    (( elapsed_ns < 0 )) && elapsed_ns=0
+    printf -v batch_elapsed '%d.%d' "$((elapsed_ns / 1000000000))" "$((elapsed_ns % 1000000000 / 100000000))"
+    batch_cache_hits=0
+    batch_cache_misses=0
+    # Fetches run in subshells. A private per-host event file carries counts
+    # back without parsing diagnostics (which summary-only suppresses).
+    if [[ -n "$host_cache_events" && -f "$host_cache_events" ]]; then
+        while IFS= read -r event; do
+            case "$event" in
+                H) batch_cache_hits=$((batch_cache_hits + 1)) ;;
+                M) batch_cache_misses=$((batch_cache_misses + 1)) ;;
+            esac
+        done < "$host_cache_events"
+    fi
+}
+
 print_final_status() {
     local report_fd=1
     if (( summary_only == 1 )); then
@@ -393,25 +416,34 @@ print_final_status() {
         printf '  DAYS REMAINING: %s\n' "${5:-N/A}"
         printf '  OVERALL: %s\n' "$6"
         printf '  REASON: %s\n' "$7"
+        printf '  ELAPSED: %ss\n' "$batch_elapsed"
+        printf '  CACHE: %s hit / %s miss\n' "$batch_cache_hits" "$batch_cache_misses"
     } >&"$report_fd"
 }
 
 # Emits a JSON record for a host that failed before a full check could be
 # completed (e.g. connection failure), so --json/--hosts-file consumers see
 # one line per host attempted instead of that host silently disappearing.
-# In text summary mode, also render the error as the final single-host report.
+# In text mode, also render the error as the final single-host report.
 emit_error_json() {
-    local err_domain=$1 err_port=$2 message=$3
+    local err_domain=$1 err_port=$2 message=$3 err_port_json=null
     batch_overall=ERROR
     batch_reason=$message
     batch_issuer=
     batch_days_left=
-    if (( summary_only == 1 )) && [[ "$output_format" == text ]]; then
+    finish_host_metrics
+    if [[ "$output_format" == text ]]; then
         print_final_status '' UNKNOWN UNKNOWN UNKNOWN '' ERROR "$message"
     fi
     [[ "$output_format" == json ]] || return 0
-    printf '{"host":"%s","port":%s,"connect_ip":%s,"issuer":null,"trust":null,"revocation":null,"expiry":null,"expiry_days_left":null,"intermediate_revoked":null,"stapled_ocsp":null,"overall":"ERROR","reason":"%s","exit_code":3,"warnings":[],"error":"%s"}\n' \
-        "$(json_escape "$err_domain")" "$err_port" "$connect_ip_json" "$(json_escape "$message")" "$(json_escape "$message")" >&3
+    # Invalid host-file ports must not inject bare text or leading-zero
+    # numbers into JSON. The error message retains the original value.
+    if [[ "$err_port" =~ ^[0-9]{1,5}$ ]]; then
+        err_port_json=$((10#$err_port))
+    fi
+    printf '{"host":"%s","port":%s,"connect_ip":%s,"issuer":null,"trust":null,"revocation":null,"expiry":null,"expiry_days_left":null,"intermediate_revoked":null,"stapled_ocsp":null,"overall":"ERROR","reason":"%s","exit_code":3,"warnings":[],"error":"%s","elapsed_seconds":%s,"cache_hits":%s,"cache_misses":%s}\n' \
+        "$(json_escape "$err_domain")" "$err_port_json" "$connect_ip_json" "$(json_escape "$message")" "$(json_escape "$message")" \
+        "$batch_elapsed" "$batch_cache_hits" "$batch_cache_misses" >&3
 }
 
 fetch() {
@@ -476,11 +508,11 @@ crl_cache_lifetime_is_valid() {
 # Cache entries are evidence, never trust anchors or cached verdicts. Validate
 # each object against this host's actual issuer/leaf, even on a cache hit.
 cache_object_is_valid() {
-    local kind=$1 object=$2 verifier=$3 cert=${4:-} report=${5:-}
+    local kind=$1 object=$2 verifier=$3 cert=${4:-} report=${5:-} is_ca=${6:-0}
     if [[ "$kind" == aia ]]; then
         is_issuer_of_leaf "$object"
     elif [[ "$kind" == ocsp ]]; then
-        ocsp_verify_response "$object" "$cert" "$verifier" "$report" || return 1
+        ocsp_verify_response "$object" "$cert" "$verifier" "$report" "$is_ca" || return 1
         # Unknown responses are reported, but not retained as reusable evidence.
         grep -Fxq -- "$cert: good" "$report" || grep -Fxq -- "$cert: revoked" "$report"
     else
@@ -491,7 +523,7 @@ cache_object_is_valid() {
 }
 
 cache_read() {
-    local kind=$1 entry=$2 destination=$3 verifier=$4 cert=${5:-} report=${6:-}
+    local kind=$1 entry=$2 destination=$3 verifier=$4 cert=${5:-} report=${6:-} is_ca=${7:-0}
     local header fetched_at now snapshot=$3
     [[ "$kind" == ocsp ]] && snapshot="$destination.snapshot"
     [[ -f "$entry" && ! -L "$entry" ]] || return 1
@@ -508,7 +540,8 @@ cache_read() {
         # one timestamp line followed by base64-encoded, signed response bytes.
         tail -n +2 "$snapshot" | openssl base64 -d -out "$destination" 2>/dev/null || return 1
     fi
-    cache_object_is_valid "$kind" "$destination" "$verifier" "$cert" "$report" || return 1
+    cache_object_is_valid "$kind" "$destination" "$verifier" "$cert" "$report" "$is_ca" || return 1
+    printf 'H\n' >> "$host_cache_events"
     printf '  Cache HIT (%s): USED verified cached download (age: %ss)\n' "${kind^^}" "$((now - fetched_at))"
 }
 
@@ -521,7 +554,7 @@ cache_read() {
 # against this call's issuer, including when caching is disabled. Callers
 # still check freshness at use time and look up each certificate's serial.
 fetch_cached_object() (
-    local kind=$1 url=$2 destination=$3 verifier=${4:-} cert=${5:-} report=${6:-}
+    local kind=$1 url=$2 destination=$3 verifier=${4:-} cert=${5:-} report=${6:-} is_ca=${7:-0}
     local key entry='' lock_file='' lock_fd lock_rc lock_held=0 cache_temp=''
     local decoder fetched_at cert_fp issuer_fp cacheable=0
     trap '[[ -z "$cache_temp" ]] || rm -f -- "$cache_temp"' EXIT
@@ -540,7 +573,7 @@ fetch_cached_object() (
             entry="$cache_dir/v1-$kind-$key.pem"
             [[ "$kind" == ocsp ]] && entry="$cache_dir/v1-ocsp-$key.ocsp"
             lock_file="$entry.lock"
-            if cache_read "$kind" "$entry" "$destination" "$verifier" "$cert" "$report"; then exit 0; fi
+            if cache_read "$kind" "$entry" "$destination" "$verifier" "$cert" "$report" "$is_ca"; then exit 0; fi
             # This subshell's umask keeps newly-created lock files private.
             # Refuse legacy mkdir locks and unsafe paths instead of allowing
             # an uncoordinated download. Opening with >> never truncates.
@@ -567,7 +600,8 @@ fetch_cached_object() (
             lock_held=1
             # The previous owner may have published while we were waiting.
             # Every host verifies the result against its own certificate.
-            if cache_read "$kind" "$entry" "$destination" "$verifier" "$cert" "$report"; then exit 0; fi
+            if cache_read "$kind" "$entry" "$destination" "$verifier" "$cert" "$report" "$is_ca"; then exit 0; fi
+            printf 'M\n' >> "$host_cache_events"
             printf '  Cache MISS (%s): NOT USED; no fresh verified entry, downloading\n' "${kind^^}"
         else
             echo "  Cache ERROR (${kind^^}): unable to compute cache key; no uncoordinated download attempted." >&2
@@ -578,7 +612,7 @@ fetch_cached_object() (
     fi
     fetched_at=$(date -u +%s)
     if [[ "$kind" == ocsp ]]; then
-        if ! fetch_ocsp_response "$url" "$destination" "$cert" "$verifier" "$report"; then exit 1; fi
+        if ! fetch_ocsp_response "$url" "$destination" "$cert" "$verifier" "$report" "$is_ca"; then exit 1; fi
     else
         if ! fetch "$url" "$destination.download"; then exit 1; fi
         decoder=crl
@@ -599,7 +633,7 @@ fetch_cached_object() (
             exit 1
         fi
         if (( lock_held == 1 )) && crl_cache_lifetime_is_valid "$destination"; then cacheable=1; fi
-    elif (( lock_held == 1 )) && cache_object_is_valid "$kind" "$destination" "$verifier" "$cert" "$report"; then
+    elif (( lock_held == 1 )) && cache_object_is_valid "$kind" "$destination" "$verifier" "$cert" "$report" "$is_ca"; then
         cacheable=1
     fi
     if (( cacheable == 1 )); then
@@ -621,7 +655,7 @@ fetch_cached_object() (
 # -resp_text). OpenSSL can print a status-time warning yet exit successfully;
 # explicitly enforce freshness rather than treating exit 0 as a valid status.
 ocsp_report_is_current() {
-    local report=$1 cert=$2 this_update next_update this_epoch next_epoch now
+    local report=$1 cert=$2 is_ca=${3:-0} this_update next_update this_epoch next_epoch now
     grep -Fxq -- "$cert: good" "$report" || grep -Fxq -- "$cert: revoked" "$report" \
         || grep -Fxq -- "$cert: unknown" "$report" || return 1
     this_update=$(sed -n 's/^[[:space:]]*This Update: *//p' "$report")
@@ -629,7 +663,13 @@ ocsp_report_is_current() {
     [[ -n "$this_update" && "$this_update" != *$'\n'* && "$next_update" != *$'\n'* ]] || return 1
     this_epoch=$(date -u -d "$this_update" +%s 2>/dev/null) || return 1
     now=$(date -u +%s)
-    (( this_epoch <= now + clock_skew && now - this_epoch <= max_ocsp_age )) || return 1
+    (( this_epoch <= now + clock_skew )) || return 1
+    # Issuer CAs can publish long-lived responses. Use their signed deadline
+    # unless the caller explicitly requested an age cap. Leaves and responses
+    # without nextUpdate always retain the configured/default age bound.
+    if (( is_ca == 0 || max_ocsp_age_set == 1 )) || [[ -z "$next_update" ]]; then
+        (( now - this_epoch <= max_ocsp_age )) || return 1
+    fi
     if [[ -n "$next_update" ]]; then
         next_epoch=$(date -u -d "$next_update" +%s 2>/dev/null) || return 1
         # No clock-skew extension beyond nextUpdate, even for a fresh download.
@@ -638,27 +678,30 @@ ocsp_report_is_current() {
 }
 
 ocsp_verify_response() {
-    local response=$1 cert=$2 verifier=$3 report=$4
+    local response=$1 cert=$2 verifier=$3 report=$4 is_ca=${5:-0}
+    local -a age_args=()
+    if (( is_ca == 0 || max_ocsp_age_set == 1 )); then age_args=(-status_age "$max_ocsp_age"); fi
     if ! timeout "$request_timeout" openssl ocsp -respin "$response" -issuer "$verifier" -cert "$cert" \
         -no_nonce -CAfile "$verifier" -partial_chain -validity_period "$clock_skew" \
-        -status_age "$max_ocsp_age" > "$report" 2>&1; then return 1; fi
-    if ! ocsp_report_is_current "$report" "$cert"; then
+        "${age_args[@]}" > "$report" 2>&1; then return 1; fi
+    if ! ocsp_report_is_current "$report" "$cert" "$is_ca"; then
         echo 'OCSP response has no matching usable status, is stale, or has invalid update times.' >> "$report"
         return 1
     fi
 }
 
 fetch_ocsp_response() {
-    local url=$1 response=$2 cert=$3 verifier=$4 report=$5 attempt=0
-    local -a ocsp_proxy_args=()
+    local url=$1 response=$2 cert=$3 verifier=$4 report=$5 is_ca=${6:-0} attempt=0
+    local -a ocsp_proxy_args=() age_args=()
+    if (( is_ca == 0 || max_ocsp_age_set == 1 )); then age_args=(-status_age "$max_ocsp_age"); fi
     [[ -n "$proxy" ]] && ocsp_proxy_args+=(-proxy "$proxy")
     [[ -n "$no_proxy" ]] && ocsp_proxy_args+=(-no_proxy "$no_proxy")
     while :; do
         : > "$response"
         if timeout "$request_timeout" openssl ocsp -issuer "$verifier" -cert "$cert" -url "$url" \
             -no_nonce -CAfile "$verifier" -partial_chain -validity_period "$clock_skew" \
-            -status_age "$max_ocsp_age" -respout "$response" "${ocsp_proxy_args[@]}" > "$report" 2>&1 \
-            && ocsp_verify_response "$response" "$cert" "$verifier" "$report"; then return 0; fi
+            "${age_args[@]}" -respout "$response" "${ocsp_proxy_args[@]}" > "$report" 2>&1 \
+            && ocsp_verify_response "$response" "$cert" "$verifier" "$report" "$is_ca"; then return 0; fi
         (( attempt >= connect_retries )) && return 1
         attempt=$((attempt + 1))
         (( retry_delay > 0 )) && sleep "$retry_delay"
@@ -692,7 +735,7 @@ certificate_issuer() {
 # the leaf (label "LEAF") and for each intermediate CA found in the chain, so
 # a revoked intermediate is caught even when the leaf itself is fine.
 check_certificate_revocation() {
-    local cert=$1 label=$2 verifier=$3
+    local cert=$1 label=$2 verifier=$3 is_ca=${4:-0}
     local cert_serial local_crl_urls idx url crl_pem
     local checked_local=0 revoked_local=0 ocsp_good_local=0
     local ocsp_url_local ocsp_output ocsp_rc ocsp_response ocsp_report
@@ -716,6 +759,10 @@ check_certificate_revocation() {
         crl_pem="$host_workdir/crl-$$-$RANDOM-${idx}.pem"
         echo; echo "Checking CRL ($label): $url"
         if is_ldap_url "$url"; then echo "  Result: LDAP CRL retrieval is not supported by this script" >&2; continue; fi
+        if [[ -z "$verifier" ]]; then
+            echo "  Result: issuer certificate unavailable; skipping CRL download because its signature cannot be verified" >&2
+            continue
+        fi
         if ! fetch_cached_object crl "$url" "$crl_pem" "$verifier"; then echo "  Result: unable to retrieve a usable CRL" >&2; continue; fi
         openssl crl -in "$crl_pem" -noout -issuer -lastupdate -nextupdate
         # fetch_cached_object verified this private snapshot's signature
@@ -742,7 +789,7 @@ check_certificate_revocation() {
         else
             ocsp_response="$host_workdir/ocsp-$$-$RANDOM.der"
             ocsp_report="$ocsp_response.txt"
-            fetch_cached_object ocsp "$ocsp_url_local" "$ocsp_response" "$verifier" "$cert" "$ocsp_report"
+            fetch_cached_object ocsp "$ocsp_url_local" "$ocsp_response" "$verifier" "$cert" "$ocsp_report" "$is_ca"
             ocsp_rc=$?
             ocsp_output=$(cat "$ocsp_report" 2>/dev/null)
             if (( ocsp_rc != 0 )); then
@@ -773,11 +820,13 @@ check_certificate_revocation() {
 # call exit itself, so --hosts-file can check many hosts in one process).
 check_host_details() {
     local domain=$1 port=$2
-    if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+    if ! [[ "$port" =~ ^0*([1-9][0-9]{0,4})$ ]] || (( 10#${BASH_REMATCH[1]} > 65535 )); then
         echo "Error: port must be between 1 and 65535 (got '$port' for host '$domain')." >&2
-        emit_error_json "$domain" "$port" "invalid port"
+        emit_error_json "$domain" "$port" "invalid port: $port"
         return 3
     fi
+    # Normalize before both the TLS connection and numeric JSON output.
+    port=$((10#${BASH_REMATCH[1]}))
 
     local host_workdir connection_host transport_host is_ip sni_args connect_target starttls_args
     local connect_attempt connect_ok
@@ -802,7 +851,11 @@ check_host_details() {
     local trust_status expiry_status revocation_status overall_status exit_code reason
     local caa_records
 
-    host_workdir=$(mktemp -d "$workdir/host.XXXXXX")
+    if ! host_workdir=$(mktemp -d "$workdir/host.XXXXXX"); then
+        emit_error_json "$domain" "$port" "unable to create host working directory"
+        return 3
+    fi
+    host_cache_events="$host_workdir/cache-events"
 
     connection_host=$domain
     if [[ "$connection_host" =~ ^\[(.*)\]$ ]]; then connection_host=${BASH_REMATCH[1]}; fi
@@ -1227,7 +1280,7 @@ check_host_details() {
             iss=$(certificate_issuer "$cert")
             [[ "$subj" == "$iss" ]] && break
             verifier=${chain_list[$((ci + 1))]:-}
-            check_certificate_revocation "$cert" "CA: $subj" "$verifier"
+            check_certificate_revocation "$cert" "CA: $subj" "$verifier" 1
             if (( rc_revoked == 1 )); then
                 intermediate_revoked=1
                 revocation_flag[$cert]=1
@@ -1399,6 +1452,7 @@ check_host_details() {
         printf '  - %s\n' "${warnings[@]}"
     fi
     echo
+    finish_host_metrics
     if [[ "$output_format" == json ]]; then
         local warnings_json='['
         for index in "${!warnings[@]}"; do
@@ -1406,12 +1460,13 @@ check_host_details() {
             warnings_json+="\"$(json_escape "${warnings[$index]}")\""
         done
         warnings_json+=']'
-        printf '{"host":"%s","port":%s,"connect_ip":%s,"issuer":"%s","trust":"%s","revocation":"%s","expiry":"%s","expiry_days_left":%s,"intermediate_revoked":%s,"stapled_ocsp":"%s","overall":"%s","reason":"%s","exit_code":%s,"warnings":%s}\n' \
+        printf '{"host":"%s","port":%s,"connect_ip":%s,"issuer":"%s","trust":"%s","revocation":"%s","expiry":"%s","expiry_days_left":%s,"intermediate_revoked":%s,"stapled_ocsp":"%s","overall":"%s","reason":"%s","exit_code":%s,"warnings":%s,"elapsed_seconds":%s,"cache_hits":%s,"cache_misses":%s}\n' \
             "$(json_escape "$domain")" "$port" "$connect_ip_json" "$(json_escape "$issuer_cn")" "$(json_escape "$trust_status")" \
             "$(json_escape "$revocation_status")" "$(json_escape "$expiry_status")" \
             "${expiry_days_left:-null}" \
             "$(if (( intermediate_revoked == 1 )); then echo true; else echo false; fi)" \
-            "$(json_escape "$stapled_ocsp")" "$(json_escape "$overall_status")" "$(json_escape "$reason")" "$exit_code" "$warnings_json" >&3
+            "$(json_escape "$stapled_ocsp")" "$(json_escape "$overall_status")" "$(json_escape "$reason")" "$exit_code" "$warnings_json" \
+            "$batch_elapsed" "$batch_cache_hits" "$batch_cache_misses" >&3
     else
         print_final_status "$issuer_cn" "$trust_status" "$revocation_status" \
             "$expiry_status" "$expiry_days_left" "$overall_status" "$reason"
@@ -1420,6 +1475,8 @@ check_host_details() {
 }
 
 check_host() {
+    local host_started_ns host_cache_events=''
+    host_started_ns=$(date +%s%N)
     # Redirection does not spawn a subshell: the caller still receives the
     # same batch result variables and exit code. JSON uses its saved fd 3.
     if (( summary_only == 1 )); then
@@ -1440,7 +1497,8 @@ if [[ -n "$hosts_file" ]]; then
 
     batch_total=${#job_hosts[@]}
     batch_worst=0
-    declare -a batch_row_host=() batch_row_overall=() batch_row_issuer=() batch_row_reason=() batch_row_days_left=()
+    declare -a batch_row_host=() batch_row_overall=() batch_row_issuer=() batch_row_reason=()
+    declare -a batch_row_stats=()
 
     record_batch_result() {
         local h=$1 p=$2 rc=$3 overall=${4:-UNKNOWN} reason=${5:-"no reason recorded"} issuer=${6:-} days_left=${7:-}
@@ -1448,7 +1506,7 @@ if [[ -n "$hosts_file" ]]; then
         batch_row_overall+=("$overall")
         batch_row_issuer+=("${issuer:-unknown}")
         batch_row_reason+=("$reason")
-        batch_row_days_left+=("${days_left:-N/A}")
+        batch_row_stats+=("${days_left:-N/A} ${batch_elapsed:-?}s ${batch_cache_hits:-?}/${batch_cache_misses:-?}")
         (( rc != 0 )) && batch_worst=1
     }
 
@@ -1491,7 +1549,11 @@ if [[ -n "$hosts_file" ]]; then
                     batch_days_left=
                     check_host "$batch_host" "$batch_port"
                     batch_rc=$?
-                    printf '%s\t%s\t%s\t%s\t%s\n' "$batch_rc" "$batch_overall" "$batch_reason" "$batch_issuer" "$batch_days_left" > "${job_results[$job_idx]}"
+                    # Put nonempty metrics first: Bash's tab IFS collapses
+                    # empty trailing issuer/days fields on early errors.
+                    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                        "$batch_elapsed" "$batch_cache_hits" "$batch_cache_misses" \
+                        "$batch_rc" "$batch_overall" "$batch_reason" "$batch_issuer" "$batch_days_left" > "${job_results[$job_idx]}"
                 } >"${job_logs[$job_idx]}" 2>&1
             ) &
             active_pids+=("$!")
@@ -1518,7 +1580,10 @@ if [[ -n "$hosts_file" ]]; then
             batch_reason=
             batch_issuer=
             batch_days_left=
-            IFS=$'\t' read -r batch_rc batch_overall batch_reason batch_issuer batch_days_left < "${job_results[$job_idx]}"
+            batch_elapsed=
+            batch_cache_hits=
+            batch_cache_misses=
+            IFS=$'\t' read -r batch_elapsed batch_cache_hits batch_cache_misses batch_rc batch_overall batch_reason batch_issuer batch_days_left < "${job_results[$job_idx]}"
             record_batch_result "${job_hosts[$job_idx]}" "${job_ports[$job_idx]}" "${batch_rc:-3}" "$batch_overall" "$batch_reason" "$batch_issuer" "$batch_days_left"
         done
     fi
@@ -1557,22 +1622,22 @@ if [[ -n "$hosts_file" ]]; then
             fi
         done
 
-        # Column widths: HOST/STATUS/ISSUER/DAYS LEFT/REASON size to their
+        # Column widths: HOST/STATUS/ISSUER/DL TIME H/M/REASON size to their
         # widest value, but ISSUER and REASON are capped (longer values are
         # shown truncated with an ellipsis) so one long entry cannot blow up
         # the whole table or wrap the terminal line; run the single host (or
         # use --json) for the untruncated reason.
         batch_issuer_cap=52
-        batch_reason_cap=72
+        batch_reason_cap=62
         declare -a batch_issuer_disp=() batch_reason_disp=()
         batch_host_w=4
         batch_status_w=6
         batch_issuer_w=6
-        batch_days_w=9
+        batch_stats_w=11
         for batch_i in "${!batch_row_host[@]}"; do
             (( ${#batch_row_host[$batch_i]} > batch_host_w )) && batch_host_w=${#batch_row_host[$batch_i]}
             (( ${#batch_row_overall[$batch_i]} > batch_status_w )) && batch_status_w=${#batch_row_overall[$batch_i]}
-            (( ${#batch_row_days_left[$batch_i]} > batch_days_w )) && batch_days_w=${#batch_row_days_left[$batch_i]}
+            (( ${#batch_row_stats[$batch_i]} > batch_stats_w )) && batch_stats_w=${#batch_row_stats[$batch_i]}
             batch_disp=${batch_row_issuer[$batch_i]}
             if (( ${#batch_disp} > batch_issuer_cap )); then
                 batch_disp="${batch_disp:0:$((batch_issuer_cap - 1))}…"
@@ -1590,19 +1655,19 @@ if [[ -n "$hosts_file" ]]; then
         [[ -n "$connect_ip" ]] && printf '  CONNECT IP: %s\n' "$connect_ip"
         echo
         printf '  %-*s  %-*s  %-*s  %*s  %s\n' \
-            "$batch_status_w" STATUS "$batch_host_w" HOST "$batch_issuer_w" ISSUER "$batch_days_w" "DAYS LEFT" REASON
+            "$batch_status_w" STATUS "$batch_host_w" HOST "$batch_issuer_w" ISSUER "$batch_stats_w" "DL TIME H/M" REASON
         printf '  %s  %s  %s  %s  %s\n' \
             "$(printf '%*s' "$batch_status_w" '' | tr ' ' '-')" \
             "$(printf '%*s' "$batch_host_w" '' | tr ' ' '-')" \
             "$(printf '%*s' "$batch_issuer_w" '' | tr ' ' '-')" \
-            "$(printf '%*s' "$batch_days_w" '' | tr ' ' '-')" \
+            "$(printf '%*s' "$batch_stats_w" '' | tr ' ' '-')" \
             "$(printf '%*s' 6 '' | tr ' ' '-')"
         for batch_i in "${batch_order[@]}"; do
             printf '  %-*s  %-*s  %-*s  %*s  %s\n' \
                 "$batch_status_w" "${batch_row_overall[$batch_i]}" \
                 "$batch_host_w" "${batch_row_host[$batch_i]}" \
                 "$batch_issuer_w" "${batch_issuer_disp[$batch_i]}" \
-                "$batch_days_w" "${batch_row_days_left[$batch_i]}" \
+                "$batch_stats_w" "${batch_row_stats[$batch_i]}" \
                 "${batch_reason_disp[$batch_i]}"
         done
     fi

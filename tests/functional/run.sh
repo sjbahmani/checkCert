@@ -29,6 +29,7 @@ AIA_PORT=8994
 OCSP_PURPOSE_PORT=8995
 SNI_PORT=8996
 IPV6_PORT=8997
+CROSS_PORT=8998
 
 export HTTPPORT
 PKI_DIR=$(bash "$script_dir/setup_pki.sh")
@@ -57,6 +58,7 @@ pids+=("$!")
 
 # leaf-good served with its full chain (intermediate)
 start_server "$GOOD_PORT" "$PKI_DIR/certs/leaf-good.pem" "$PKI_DIR/chain-good.pem"
+start_server "$CROSS_PORT" "$PKI_DIR/certs/leaf-good.pem" "$PKI_DIR/chain-cross.pem"
 # leaf-revoked served with its full chain
 start_server "$REVOKED_PORT" "$PKI_DIR/certs/leaf-revoked.pem" "$PKI_DIR/chain-good.pem"
 # leaf3 served with its full chain (intermediate2 + root) — intermediate2 gets revoked
@@ -76,7 +78,7 @@ pids+=("$!")
 start_server "$IPV6_PORT" "$PKI_DIR/certs/leaf-good.pem" "$PKI_DIR/chain-good.pem" ::1
 
 sleep 1
-for p in "$HTTPPORT" "$GOOD_PORT" "$REVOKED_PORT" "$LEAF3_PORT" "$AIA_PORT" "$OCSP_PURPOSE_PORT" "$SNI_PORT"; do
+for p in "$HTTPPORT" "$GOOD_PORT" "$REVOKED_PORT" "$LEAF3_PORT" "$AIA_PORT" "$OCSP_PURPOSE_PORT" "$SNI_PORT" "$CROSS_PORT"; do
     timeout 3 bash -c "echo > /dev/tcp/127.0.0.1/$p" 2>/dev/null || {
         echo "FAIL: server on port $p did not come up" >&2
         exit 1
@@ -196,26 +198,57 @@ json_matches() {
     jq -e -s "$1" "$2" >/dev/null
 }
 
+same_final_status() {
+    diff -u <(sed '/^  ELAPSED:/d' "$1") <(sed '/^  ELAPSED:/d' "$2")
+}
+
+stable_batch_columns() {
+    # Timing and which parallel worker wins the cache lock may vary. Strip
+    # elapsed time and counters, retaining days left and all other fields.
+    awk '
+        /^ *[- ]+$/ { next }
+        {
+            sub(/[0-9]+\.[0-9]s [0-9]+\/[0-9]+/, "")
+            gsub(/ +/, " ")
+            print
+        }
+    ' "$1"
+}
+
+same_batch_status() {
+    diff -u <(stable_batch_columns "$1") <(stable_batch_columns "$2")
+}
+
 # Compare the entire concise output with the corresponding portion of the
-# full report: this catches leaked progress, tree output, and lost fields.
+# full report, excluding timing: catch leaked progress and lost fields.
 check_exit "--summary-only: good leaf keeps exit 0" 0 \
     "$check" --summary-only --ca-file "$PKI_DIR/certs/root.pem" 127.0.0.1 "$GOOD_PORT"
-assert_output "single-host summary exactly matches the full report's final status" \
-    cmp -s "$PKI_DIR/good-final.txt" /tmp/functest.out
+assert_output "single-host summary matches the full final status apart from timing" \
+    same_final_status "$PKI_DIR/good-final.txt" /tmp/functest.out
+assert_output "single-host summary includes elapsed seconds" \
+    grep -Eq '^  ELAPSED: [0-9]+\.[0-9]s$' /tmp/functest.out
+assert_output "single-host summary counts its fresh CRL" \
+    grep -qx '  CACHE: 0 hit / 1 miss' /tmp/functest.out
 assert_output "single-host summary suppresses diagnostics" test ! -s /tmp/functest.err
 
 check_exit "--summary-only: revoked leaf keeps exit 2" 2 \
     "$check" --summary-only --ca-file "$PKI_DIR/certs/root.pem" 127.0.0.1 "$REVOKED_PORT"
-assert_output "revoked summary exactly matches the full report's final status" \
-    cmp -s "$PKI_DIR/revoked-final.txt" /tmp/functest.out
+assert_output "revoked summary matches the full final status apart from timing" \
+    same_final_status "$PKI_DIR/revoked-final.txt" /tmp/functest.out
 assert_output "revoked summary suppresses diagnostics" test ! -s /tmp/functest.err
 
 for parallel in 1 3; do
     check_exit "--summary-only --parallel $parallel: mixed batch keeps exit 1" 1 \
         "$check" --summary-only --parallel "$parallel" --ca-file "$PKI_DIR/certs/root.pem" \
         --hosts-file "$PKI_DIR/hosts.txt"
-    assert_output "batch summary ($parallel workers) contains only the unchanged table" \
-        cmp -s "$PKI_DIR/batch-summary.txt" /tmp/functest.out
+    assert_output "batch summary ($parallel workers) preserves the other table columns" \
+        same_batch_status "$PKI_DIR/batch-summary.txt" /tmp/functest.out
+    assert_output "batch summary ($parallel workers) has one compact metrics column" \
+        grep -q 'ISSUER  *DL TIME H/M  *REASON' /tmp/functest.out
+    assert_output "batch summary ($parallel workers) has one cache miss" \
+        test "$(grep -Ec '[0-9]+\.[0-9]s 0/1  ' /tmp/functest.out)" -eq 1
+    assert_output "batch summary ($parallel workers) has one cache hit" \
+        test "$(grep -Ec '[0-9]+\.[0-9]s 1/0  ' /tmp/functest.out)" -eq 1
     assert_output "batch summary ($parallel workers) suppresses diagnostics" test ! -s /tmp/functest.err
 done
 
@@ -229,15 +262,44 @@ assert_output "connection error overall status" grep -qx '  OVERALL: ERROR' /tmp
 assert_output "connection error includes the failure reason" \
     grep -q '^  REASON: unable to connect' /tmp/functest.out
 assert_output "connection error summary suppresses diagnostics" test ! -s /tmp/functest.err
+assert_output "connection error includes elapsed seconds" \
+    grep -Eq '^  ELAPSED: [0-9]+\.[0-9]s$' /tmp/functest.out
+assert_output "connection error has zero cache events" \
+    grep -qx '  CACHE: 0 hit / 0 miss' /tmp/functest.out
+
+# Early errors have no issuer/days fields; their metrics must survive the
+# parallel result file and must not inherit a previous host's counters.
+printf '127.0.0.1 %s\n127.0.0.1 %s\n127.0.0.1 65536\n' \
+    "$GOOD_PORT" "$HTTPPORT" > "$PKI_DIR/hosts-metrics-errors.txt"
+for parallel in 1 3; do
+    check_exit "batch metrics survive early errors ($parallel workers)" 1 \
+        "$check" --no-caa --summary-only --connect-retries 0 --connect-timeout 1 \
+        --parallel "$parallel" --ca-file "$PKI_DIR/certs/root.pem" --hosts-file "$PKI_DIR/hosts-metrics-errors.txt"
+    assert_output "error rows have zero hits/misses ($parallel workers)" \
+        test "$(grep -Ec '^  ERROR .* [0-9]+\.[0-9]s 0/0  ' /tmp/functest.out)" -eq 2
+    assert_output "healthy row retains its own counters ($parallel workers)" \
+        grep -Eq '^  VALID .* [0-9]+\.[0-9]s 0/1  ' /tmp/functest.out
+done
 
 check_exit "JSON baseline: good leaf" 0 \
     "$check" --json --ca-file "$PKI_DIR/certs/root.pem" 127.0.0.1 "$GOOD_PORT"
 cp /tmp/functest.out "$PKI_DIR/good.json"
 check_exit "--json --summary-only: good leaf" 0 \
     "$check" --json --summary-only --ca-file "$PKI_DIR/certs/root.pem" 127.0.0.1 "$GOOD_PORT"
-assert_output "summary flag preserves the full JSON record, including warnings" \
-    cmp -s "$PKI_DIR/good.json" /tmp/functest.out
+assert_output "summary flag preserves JSON fields apart from elapsed time" \
+    diff -u <(jq -S 'del(.elapsed_seconds)' "$PKI_DIR/good.json") <(jq -S 'del(.elapsed_seconds)' /tmp/functest.out)
+assert_output "JSON includes numeric elapsed seconds and host cache counts" \
+    json_matches 'all(.[]; (.elapsed_seconds | type == "number" and . >= 0) and .cache_hits == 0 and .cache_misses == 1)' /tmp/functest.out
 assert_output "JSON summary suppresses diagnostics" test ! -s /tmp/functest.err
+
+check_exit "invalid port keeps a valid JSON error record" 3 \
+    "$check" --json --summary-only 127.0.0.1 not-a-port
+assert_output "invalid port JSON retains metrics and the rejected value" \
+    json_matches 'length == 1 and (.[0] | .port == null and .error == "invalid port: not-a-port" and .cache_hits == 0 and .cache_misses == 0 and .elapsed_seconds >= 0)' /tmp/functest.out
+check_exit "zero-padded port is treated as decimal" 0 \
+    "$check" --no-caa --json --summary-only --ca-file "$PKI_DIR/certs/root.pem" 127.0.0.1 "00$GOOD_PORT"
+assert_output "zero-padded port produces a canonical JSON number" \
+    json_matches "length == 1 and (.[0] | .port == $GOOD_PORT and .overall == \"VALID\")" /tmp/functest.out
 
 check_exit "--summary-only --json: parallel mixed batch keeps exit 1" 1 \
     "$check" --summary-only --json --parallel 3 --ca-file "$PKI_DIR/certs/root.pem" \
@@ -346,6 +408,30 @@ seed_cache() {
     { printf '# checkCRT-cache-v1 %s\n' "$timestamp"; cat "$source"; } > "$destination"
 }
 
+# Trust can end at the local self-signed root while the server presents a
+# cross-signed copy. Its absent legacy issuer cannot verify its own CRL.
+for cross_mode in cold warm disabled; do
+    cross_args=(--cache-dir "$PKI_DIR/cross-cache")
+    cross_fetches=1 cross_hits=0 cross_misses=1
+    if [[ "$cross_mode" == warm ]]; then
+        cross_fetches=0 cross_hits=1 cross_misses=0
+    elif [[ "$cross_mode" == disabled ]]; then
+        cross_args+=(--no-cache)
+        cross_misses=0
+    fi
+    : > "$CHECKCRT_TEST_FETCH_LOG"
+    check_exit "missing cross-signer preserves the trusted alternate path ($cross_mode)" 0 \
+        "$check" "${cache_args[@]}" "${cross_args[@]}" --json 127.0.0.1 "$CROSS_PORT"
+    assert_output "missing cross-signer never causes an unusable CRL download ($cross_mode)" \
+        fetch_count_is "$cross_fetches"
+    assert_output "cross-signed root reports its missing issuer ($cross_mode)" \
+        grep -q 'issuer certificate unavailable; skipping CRL download' /tmp/functest.err
+    assert_output "cross-signed root CRL does not generate a signature failure ($cross_mode)" \
+        test "$(grep -c 'CRL signature could not be verified' /tmp/functest.err)" -eq 0
+    assert_output "skipped cross-signed root CRL does not count as a cache event ($cross_mode)" \
+        json_matches "length == 1 and (.[0] | .cache_hits == $cross_hits and .cache_misses == $cross_misses and .overall == \"VALID\")" /tmp/functest.out
+done
+
 for parallel in 1 3; do
     : > "$CHECKCRT_TEST_FETCH_LOG"
     check_exit "run cache: repeated AIA-only hosts ($parallel workers)" 0 \
@@ -353,8 +439,10 @@ for parallel in 1 3; do
     assert_output "run cache downloads AIA and CRL just once ($parallel workers)" fetch_count_is 2
     assert_output "cache diagnostics do not leak into JSON ($parallel workers)" \
         json_matches 'length == 3 and all(.[]; .overall == "VALID" and .revocation == "NOT REVOKED")' /tmp/functest.out
+    assert_output "cache counters belong to each host ($parallel workers)" \
+        json_matches 'all(.[]; .cache_hits + .cache_misses == 2 and .elapsed_seconds >= 0) and ([.[].cache_hits] | add) == 4 and ([.[].cache_misses] | add) == 2' /tmp/functest.out
     assert_output "JSON diagnostics identify per-run cache mode ($parallel workers)" \
-        grep -q '^Cache mode: PER-RUN (max age: 14400s)$' /tmp/functest.err
+        grep -q '^Cache mode: PER-RUN (max age: 86400s)$' /tmp/functest.err
     assert_output "JSON diagnostics explicitly report reused evidence ($parallel workers)" \
         grep -q 'Cache HIT (CRL): USED verified cached download' /tmp/functest.err
 done
@@ -365,6 +453,8 @@ check_exit "--no-cache bypasses reads/writes even with --cache-dir" 0 \
     --parallel 3 --hosts-file "$PKI_DIR/hosts-cache.txt"
 assert_output "uncached repeated hosts each download their own AIA and CRL" fetch_count_is 6
 assert_output "--no-cache does not create a persistent directory" test ! -e "$PKI_DIR/unused-cache"
+assert_output "disabled caching counts neither hits nor misses for each host" \
+    test "$(grep -cx '  CACHE: 0 hit / 0 miss' /tmp/functest.out)" -eq 3
 assert_output "disabled cache mode is logged" grep -q '^Cache mode: DISABLED (--no-cache)$' /tmp/functest.out
 assert_output "uncached CRL download is explicitly logged" \
     grep -q 'Cache BYPASS (CRL): NOT USED; disabled by --no-cache' /tmp/functest.out
@@ -421,14 +511,14 @@ check_exit "--no-cache ignores an existing warm cache during HTTP outage" 3 \
 assert_output "--no-cache forces a real download attempt" fetch_count_is 1
 assert_output "--no-cache leaves existing entries untouched" cmp -s "$PKI_DIR/warm-crl.pem" "$cached_crl"
 
-seed_cache "$cached_crl" "$PKI_DIR/www/intermediate.crl" "$(( $(date -u +%s) - 7200 ))"
+seed_cache "$cached_crl" "$PKI_DIR/www/intermediate.crl" "$(( $(date -u +%s) - 43200 ))"
 : > "$CHECKCRT_TEST_FETCH_LOG"
-check_exit "default four-hour TTL reuses a two-hour-old CRL during HTTP outage" 0 \
+check_exit "default 24-hour TTL reuses a twelve-hour-old CRL during HTTP outage" 0 \
     "$check" "${cache_args[@]}" --cache-dir "$persistent_cache" 127.0.0.1 "$GOOD_PORT"
-assert_output "two-hour-old CRL needs no HTTP request with the default TTL" fetch_count_is 0
-assert_output "persistent cache reports the four-hour default" \
-    grep -Fxq "Cache mode: PERSISTENT (max age: 14400s; directory: $persistent_cache)" /tmp/functest.out
-check_exit "explicit one-hour TTL still rejects a two-hour-old CRL" 3 \
+assert_output "twelve-hour-old CRL needs no HTTP request with the default TTL" fetch_count_is 0
+assert_output "persistent cache reports the 24-hour default" \
+    grep -Fxq "Cache mode: PERSISTENT (max age: 86400s; directory: $persistent_cache)" /tmp/functest.out
+check_exit "explicit one-hour TTL still rejects a twelve-hour-old CRL" 3 \
     "$check" "${cache_args[@]}" --cache-dir "$persistent_cache" --cache-max-age 3600 --summary-only 127.0.0.1 "$GOOD_PORT"
 assert_output "explicit shorter TTL attempts a fresh download" fetch_count_is 1
 
@@ -510,7 +600,7 @@ check_exit "cached CRL signed by the wrong issuer is refreshed" 0 \
     "$check" "${cache_args[@]}" --cache-dir "$persistent_cache" 127.0.0.1 "$GOOD_PORT"
 assert_output "wrong-issuer CRL cannot satisfy a cache hit" fetch_count_is 1
 
-for timestamp in "$(( $(date -u +%s) - 18000 ))" "$(( $(date -u +%s) + 7200 ))"; do
+for timestamp in "$(( $(date -u +%s) - 90000 ))" "$(( $(date -u +%s) + 7200 ))"; do
     seed_cache "$cached_crl" "$PKI_DIR/www/intermediate.crl" "$timestamp"
     : > "$CHECKCRT_TEST_FETCH_LOG"
     check_exit "out-of-range cache timestamp triggers refresh" 0 \
@@ -533,7 +623,7 @@ check_exit "same-subject cached AIA issuer with the wrong key is rejected" 0 \
     "$check" "${cache_args[@]}" --cache-dir "$persistent_cache" 127.0.0.1 "$AIA_PORT"
 assert_output "AIA cache requires a signature check, not just a name match" fetch_count_is 1
 
-seed_cache "$cached_aia" "$PKI_DIR/certs/intermediate.pem" "$(( $(date -u +%s) - 18000 ))"
+seed_cache "$cached_aia" "$PKI_DIR/certs/intermediate.pem" "$(( $(date -u +%s) - 90000 ))"
 : > "$CHECKCRT_TEST_FETCH_LOG"
 check_exit "AIA cache has a bounded age too" 0 \
     "$check" "${cache_args[@]}" --cache-dir "$persistent_cache" 127.0.0.1 "$AIA_PORT"
@@ -646,6 +736,10 @@ assert_output "slow download waiters report their wait" \
     grep -q 'Cache WAIT (CRL)' /tmp/functest.err
 assert_output "slow shared download preserves all host results" \
     json_matches 'length == 3 and all(.[]; .overall == "VALID")' /tmp/functest.out
+assert_output "slow shared download records two hits and only one miss" \
+    json_matches 'all(.[]; .cache_hits + .cache_misses == 1) and ([.[].cache_hits] | add) == 2 and ([.[].cache_misses] | add) == 1' /tmp/functest.out
+assert_output "elapsed seconds include the slow download and stay within the test timeout" \
+    json_matches '([.[].elapsed_seconds] | max) >= 7 and all(.[]; .elapsed_seconds < 45)' /tmp/functest.out
 
 # A lock file remains after its owner exits, but its kernel lock is released.
 seed_cache "$cached_crl" "$PKI_DIR/stale.crl"

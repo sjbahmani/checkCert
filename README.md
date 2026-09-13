@@ -65,7 +65,7 @@ government sites, plus `google.com` as a non-Iranian baseline:
 messages are written to standard error. This makes it suitable for monitoring:
 
 ```json
-{"host":"example.com","port":443,"connect_ip":null,"issuer":"CN=WE2,O=Google Trust Services,C=US","trust":"TRUSTED","revocation":"NOT REVOKED","expiry":"NOT EXPIRED","expiry_days_left":46,"intermediate_revoked":false,"stapled_ocsp":"NOT STAPLED","overall":"VALID","exit_code":0,"warnings":[]}
+{"host":"example.com","port":443,"connect_ip":null,"issuer":"CN=WE2,O=Google Trust Services,C=US","trust":"TRUSTED","revocation":"NOT REVOKED","expiry":"NOT EXPIRED","expiry_days_left":46,"intermediate_revoked":false,"stapled_ocsp":"NOT STAPLED","overall":"VALID","exit_code":0,"warnings":[],"elapsed_seconds":1.2,"cache_hits":3,"cache_misses":1}
 ```
 
 Use `--summary-only` to hide certificate details, the CA tree, progress, and
@@ -80,6 +80,22 @@ diagnostics on standard error are suppressed. Invalid command-line arguments
 and startup errors are still reported. If a single-host check cannot complete,
 the text summary reports `OVERALL: ERROR`, `UNKNOWN` check statuses, and the
 failure reason (exit 3).
+
+Every host reports `ELAPSED` in seconds to one decimal place and `CACHE` as
+hit/miss counts. Elapsed time covers that host's check, including network
+retries and waiting for shared downloads; it excludes shared startup work
+and time queued before the host starts. JSON success and error records expose
+the numeric fields `elapsed_seconds`, `cache_hits`, and `cache_misses`.
+Port numbers are interpreted as decimal, including leading zeros. Invalid-port
+JSON errors use `null` when the input cannot be represented as a small unsigned
+integer, and retain the rejected value in the error message.
+
+Counts combine CRL, AIA, and OCSP objects. A hit means a verified cached
+object was used, including after waiting for another worker. A miss means a
+new object fetch was attempted with caching enabled, even if that fetch
+failed; its network retries do not add more misses. Waiting alone does not
+count as a miss. With `--no-cache`, or if the host fails before requesting
+any objects, both counts are zero.
 
 ## Check a specific backend
 
@@ -128,7 +144,7 @@ runs, choose a persistent directory:
   not group- or world-writable. New directories and cache entries are private
   (`700` and `600`). Existing directory permissions are never changed.
 - `--cache-max-age N` limits CRL, AIA, and OCSP download age to
-  **14400 seconds (4 hours)** by default. Accepts positive integer seconds,
+  **86400 seconds (24 hours)** by default. Accepts positive integer seconds,
   up to 9 digits. Reuse does not reset the download timestamp.
 - `--no-cache` bypasses all cache reads and writes, even when `--cache-dir`
   is also supplied, and does not create that directory.
@@ -155,10 +171,19 @@ responses can be cached; `unknown`, failed, and unverifiable responses cannot.
 
 OCSP reuse is limited by **all** of the following:
 
-- The download-age limit (`--cache-max-age`, default 4 hours).
-- The signed `thisUpdate` age (`--max-ocsp-age`, default 24 hours), whether
-  or not the responder includes `nextUpdate`.
+- The download-age limit (`--cache-max-age`, default 24 hours).
+- For leaf certificates and responses without `nextUpdate`, the signed
+  `thisUpdate` age (`--max-ocsp-age`, default 24 hours).
 - The signed `nextUpdate`, when present. Clock skew never extends this limit.
+
+CA certificates in the issuer chain, including cross-signed roots, may have
+OCSP responses with long signed validity periods. By default, a CA response
+with `nextUpdate` uses that signed deadline instead of the one-day age limit.
+Explicitly passing `--max-ocsp-age N` also enforces that age limit on these CA
+responses. The download-age limit still applies to every cached object;
+`--cache-max-age` can be increased when longer reuse is wanted, but never
+extends a signed `nextUpdate` deadline. All signatures, certificate IDs, and
+future `thisUpdate` checks remain enforced.
 
 Without `nextUpdate`, both age limits still apply. Missing/unparseable update
 times and `thisUpdate` values beyond `--clock-skew` in the future are rejected.
@@ -258,15 +283,18 @@ code:
 ```text
 BATCH SUMMARY (4 host(s) checked)
 
-  STATUS   HOST            ISSUER                                      DAYS LEFT  REASON
-  -------  --------------  ------------------------------------------  ---------  ------
-  REVOKED  bmi.ir:443      CN=Certum OV TLS G2 R39 CA,O=Asseco Data …        42  leaf certificate is revoked
-  VALID    example.com:443 CN=WE2,O=Google Trust Services,C=US               46  trusted, not revoked, not expiring soon
+  STATUS   HOST             ISSUER                                      DL TIME H/M  REASON
+  -------  ---------------  ------------------------------------------  -----------  ------
+  REVOKED  bmi.ir:443       CN=Certum OV TLS G2 R39 CA,O=Asseco Data …   42 1.2s 0/1  leaf certificate is revoked
+  VALID    example.com:443  CN=WE2,O=Google Trust Services,C=US          46 0.4s 1/0  trusted, not revoked, not expiring soon
   ...
 ```
 
-The `ISSUER` column is truncated with `…` past 42 characters and `REASON`
-past 60 characters to keep the table readable. Run a single-host check or use
+`DL TIME H/M` combines days left, elapsed seconds, and cache hits/misses:
+`42 1.2s 3/1` means 42 days left, 1.2 seconds, three hits, and one miss.
+
+The `ISSUER` column is truncated with `…` past 52 characters and `REASON`
+past 62 characters to keep the table readable. Run a single-host check or use
 `--json` to obtain the complete reason.
 
 ## STARTTLS
@@ -311,9 +339,11 @@ CRLs must have a valid signature and a current `lastUpdate`/`nextUpdate`
 period. Both downloaded and cached CRLs require explicit `verify OK` plus a
 successful OpenSSL exit code: OpenSSL 3.0 may return success even when it
 reports a signature failure. This check also supports OpenSSL 3.5.
-OCSP responses are signature-verified, tolerate only the configured
-clock skew, and are rejected when older than `--max-ocsp-age` (24 hours by
-default). `STAPLED OCSP` reports the status sent during the TLS handshake; it
+OCSP responses are signature-verified and tolerate only the configured clock
+skew. Leaf responses and responses without `nextUpdate` have a default maximum
+age of 24 hours. CA responses with `nextUpdate` use that signed deadline;
+an explicit `--max-ocsp-age` additionally limits their age. `STAPLED OCSP`
+reports the status sent during the TLS handshake; it
 is marked `UNVERIFIED` because OpenSSL's `s_client` text output does not expose
 the raw staple for independent signature verification. The direct OCSP query
 or its reverified, still-current cached response supplies verified OCSP evidence.
@@ -341,16 +371,24 @@ and escalates `REVOCATION`/`OVERALL` to `REVOKED` (exit 2) exactly like a
 revoked leaf. The chain walk stops at the root (never revocation-checked
 against itself) or at the first unresolvable issuer.
 
+If the actual issuer is unavailable, CRL downloads for that certificate are
+skipped because their signatures cannot be verified. This also avoids repeated
+cache misses for a cross-signed root with a missing issuer. An equivalent local
+root can provide an alternate trust path, but cannot verify the other issuer's
+CRL. Skipped checks supply no revocation evidence.
+
 Use `--connect-timeout`, `--request-timeout`, `--max-ocsp-age`, and
-`--clock-skew` to tune monitoring behavior. `--proxy` and `--no-proxy` apply
+`--clock-skew` to tune monitoring behavior. Connection timeout defaults to
+2 seconds and request timeout to 60 seconds to allow large CRL downloads to
+finish. `--proxy` and `--no-proxy` apply
 to CRL and OCSP HTTP requests; direct TLS certificate retrieval is not routed
 through an HTTP proxy.
 
 If a network operation fails (transient blips, filtering, etc.) — the
 initial TLS connection, a CRL download, or an OCSP query — it's retried
 automatically. `--connect-retries` sets how many extra attempts to make for
-each of these (default 4; `0` disables retrying) and `--retry-delay` sets
-the pause between attempts in seconds (default 3). This applies per host, so
+each of these (default 3; `0` disables retrying) and `--retry-delay` sets
+the pause between attempts in seconds (default 1). This applies per host, so
 in `--hosts-file` batch mode each host gets its own retries. Without this, a
 single transient CRL/OCSP failure for a certificate that has no other usable
 revocation source would surface as `REVOCATION: UNKNOWN` even though the
@@ -380,6 +418,8 @@ FINAL STATUS
   REVOCATION: NOT REVOKED | REVOKED | UNKNOWN
   EXPIRY: NOT EXPIRED | EXPIRING SOON | EXPIRED
   OVERALL: VALID | REVOKED | EXPIRED | UNTRUSTED/INVALID | UNKNOWN
+  ELAPSED: 1.2s
+  CACHE: 3 hit / 1 miss
 ```
 
 Immediately before it, `CA TREE` displays the leaf and each cryptographically
