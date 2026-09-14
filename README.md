@@ -394,10 +394,10 @@ Temporary transport failures and HTTP 408, 429, 500, 502, 503, and 504 are
 retried automatically. Other HTTP failures, unsupported TLS/protocol settings,
 and invalid or stale OCSP responses stop without further retries.
 `--connect-retries` sets how many extra attempts to make for
-each of these (default 3; `0` disables retrying) and `--retry-delay` sets
-the initial pause in seconds (default 1; up to 9 digits). The pause doubles
-after each failure, capped at 6 seconds: the default three retries wait
-1, 2, then 4 seconds. `--retry-delay 0` disables waiting. Each TLS connection,
+each of these (default 6; `0` disables retrying) and `--retry-delay` sets
+the initial pause in seconds (default 1; up to 9 digits). The pause holds
+for two attempts before doubling, capped at 6 seconds: the default six
+retries wait 1, 1, 2, 2, 4, then 6 seconds. `--retry-delay 0` disables waiting. Each TLS connection,
 CRL/AIA download, and OCSP query starts its own backoff sequence; a successful
 attempt stops retrying immediately. In `--hosts-file` batch mode each host
 gets its own retries. Without this, a

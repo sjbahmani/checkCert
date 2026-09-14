@@ -20,7 +20,7 @@ for failure in temporary permanent; do
         "$check" --no-cache --no-caa --connect-retries 3 --retry-delay 1 \
         example.invalid > "$scratch/out" 2> "$scratch/err"; then actual=0
     else actual=$?; fi
-    expected_attempts=4 expected_delays='1,2,4'
+    expected_attempts=4 expected_delays='1,1,2'
     [[ "$failure" != permanent ]] || { expected_attempts=1; expected_delays=''; }
     if [[ "$actual" != 3 || $(wc -l < "$CHECKCRT_TEST_TLS_LOG") != "$expected_attempts" \
         || $(paste -sd, "$CHECKCRT_TEST_SLEEP_LOG") != "$expected_delays" ]]; then
@@ -29,7 +29,7 @@ for failure in temporary permanent; do
         exit 1
     fi
     if [[ "$failure" == temporary ]]; then
-        grep -q 'TLS connection failed; retry 3/3 in 4s' "$scratch/err"
+        grep -q 'TLS connection failed; retry 3/3 in 2s' "$scratch/err"
     fi
     echo "PASS: TLS $failure retry count, backoff, and failure status"
 done

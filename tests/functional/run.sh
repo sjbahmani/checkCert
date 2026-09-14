@@ -419,12 +419,12 @@ check_exit "TLS transient/permanent retry classification" 0 \
 
 for retry_case in default zero capped success decimal; do
     retry_base=1 retry_count=3 retry_failures=99 retry_exit=3 retry_fetches=4
-    expected_delays='1,2,4'
+    expected_delays='1,1,2'
     case "$retry_case" in
         zero) retry_base=0; expected_delays='' ;;
-        capped) retry_base=2; retry_count=4; retry_fetches=5; expected_delays='2,4,6,6' ;;
-        success) retry_failures=2; retry_exit=0; retry_fetches=3; expected_delays='1,2' ;;
-        decimal) retry_base=0002; expected_delays='2,4,6' ;;
+        capped) retry_base=2; retry_count=4; retry_fetches=5; expected_delays='2,2,4,4' ;;
+        success) retry_failures=2; retry_exit=0; retry_fetches=3; expected_delays='1,1' ;;
+        decimal) retry_base=0002; expected_delays='2,2,4' ;;
     esac
     : > "$CHECKCRT_TEST_FETCH_LOG"
     : > "$CHECKCRT_TEST_SLEEP_LOG"
@@ -467,7 +467,7 @@ for http_client in curl wget; do
             "${client_runner[@]}" env PATH="$client_path" CHECKCRT_TEST_HTTP_STATUS="$status" \
             "$check" "${cache_args[@]}" --no-cache --connect-retries 3 --retry-delay 1 \
             127.0.0.1 "$GOOD_PORT"
-        expected_fetches=4 expected_delays='1,2,4'
+        expected_fetches=4 expected_delays='1,1,2'
         [[ "$status" != 404 ]] || { expected_fetches=1; expected_delays=''; }
         assert_output "$http_client HTTP $status attempt count" fetch_count_is "$expected_fetches"
         assert_output "$http_client HTTP $status wait sequence" \

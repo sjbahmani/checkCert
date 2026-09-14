@@ -284,7 +284,7 @@ for retry_base in 1 0; do
         --connect-retries 3 --retry-delay "$retry_base" --cache-dir "$fixture_dir/retry-cache-$retry_base" \
         127.0.0.1 "$good_port"
     assert "OCSP makes four attempts per response with delay $retry_base" requests 8
-    expected_delays='1,2,4,1,2,4'
+    expected_delays='1,1,2,1,1,2'
     [[ "$retry_base" != 0 ]] || expected_delays=''
     assert "OCSP backoff resets for each response with delay $retry_base" \
         test "$(paste -sd, "$CHECKCRT_TEST_SLEEP_LOG")" = "$expected_delays"

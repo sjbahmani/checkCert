@@ -24,7 +24,7 @@ cache_dir_set=0
 cache_max_age=86400
 connect_timeout=2
 request_timeout=60
-connect_retries=3
+connect_retries=6
 retry_delay=1
 max_ocsp_age=86400
 max_ocsp_age_set=0
@@ -67,7 +67,7 @@ Options:
   --request-timeout N CRL/OCSP request timeout in seconds (default: 60).
   --connect-retries N Retry a failed network operation (initial TLS
                       connection, CRL download, or OCSP query) up to N
-                      extra times (default: 3; 0 disables retrying).
+                      extra times (default: 6; 0 disables retrying).
                       Only temporary transport/HTTP failures are retried.
   --retry-delay N     Initial retry delay in seconds (default: 1; 0 disables
                       waiting). Doubles each retry, capped at 6 seconds.
@@ -451,12 +451,19 @@ emit_error_json() {
 }
 
 retry_wait() {
-    local retry_number=$1 operation=$2 delay=$retry_delay step max_delay=6
+    local retry_number=$1 operation=$2 delay max_delay=6
+    # Each multiplier holds for two attempts before doubling, giving a
+    # gentler ramp than doubling every attempt (1, 1, 2, 2, 4, then the
+    # cap): more chances at each rung before escalating the wait.
+    local -a schedule=(1 1 2 2 4)
+    if (( retry_delay == 0 )); then
+        delay=0
+    elif (( retry_number <= ${#schedule[@]} )); then
+        delay=$((retry_delay * schedule[retry_number - 1]))
+    else
+        delay=$max_delay
+    fi
     (( delay > max_delay )) && delay=$max_delay
-    for (( step = 1; step < retry_number && delay > 0 && delay < max_delay; step++ )); do
-        delay=$((delay * 2))
-        (( delay > max_delay )) && delay=$max_delay
-    done
     printf '%s failed; retry %s/%s in %ss ...\n' "$operation" "$retry_number" "$connect_retries" "$delay" >&2
     if (( delay > 0 )); then sleep "$delay"; fi
 }
