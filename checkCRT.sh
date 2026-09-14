@@ -675,12 +675,17 @@ fetch_cached_object() (
             while :; do
                 # Five seconds is a recheck interval, never permission to
                 # download around an owner. flock wakes early on release.
-                if flock -x -w 5 -E 200 "$lock_fd"; then
+                # No -E here: flock's default timeout/conflict exit code is
+                # 1 on every util-linux version (the -E option to customize
+                # it was only added in 2.32/2018), so relying on it without
+                # a capability check would fail closed -- treating every
+                # lock attempt as a hard error -- on older systems.
+                if flock -x -w 5 "$lock_fd"; then
                     break
                 else
                     lock_rc=$?
                 fi
-                if (( lock_rc != 200 )); then
+                if (( lock_rc != 1 )); then
                     echo "  Cache ERROR (${kind^^}): cannot acquire cache lock; no uncoordinated download attempted." >&2
                     exit 1
                 fi
@@ -794,7 +799,6 @@ fetch_ocsp_response() {
     # common transport to preserve HTTP status, deadlines, proxy settings, and
     # retry classification; OpenSSL still verifies the exact returned bytes.
     fetch "$url" "$response" "$request" 'OCSP request' >> "$report" 2>&1 || return 1
-    fetch_failure_shared=0
     ocsp_verify_response "$response" "$cert" "$verifier" "$report" "$is_ca"
 }
 
