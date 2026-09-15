@@ -14,6 +14,7 @@
 # Banking
 bankmellat.ir
 mellat.ir
+ebanking.mellat.ir
 bpmellat.ir
 bmi.ir
 sb24.ir
@@ -29,7 +30,9 @@ parsian-bank.ir
 bank-melli.ir
 baambank.ir
 sb24.com
+ib.sb24.com
 bpi.ir
+vbank.bpi.ir
 middleeastbank.ir
 bankino.digital
 blubank.com
