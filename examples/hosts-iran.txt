@@ -20,9 +20,12 @@ bmi.ir
 sb24.ir
 banksepah.ir
 sphbank.ir
+ebank.sphbank.ir
 bsi.ir
+ib.bsi.ir
 bank-maskan.ir
 tejaratbank.ir
+ib.tejaratbank.ir
 postbank.ir
 #refah-bank.ir
 rb24.ir
@@ -33,11 +36,13 @@ sb24.com
 ib.sb24.com
 bpi.ir
 vbank.bpi.ir
+wepod.ir
 middleeastbank.ir
 bankino.digital
 blubank.com
 enbank.ir
 iparsian724.ir
+ipb.iparsian724.ir
 omidbank.ir
 bki.ir
 bank-keshavarzi.com
