@@ -52,7 +52,7 @@ postbank.ir
 rb24.ir
 ib.rb24.ir
 red-bank.ir
-#refah-bank.ir
+refah-bank.ir
 vbank.rqb.ir
 rqbank.ir
 sb24.com
@@ -85,7 +85,6 @@ finnotech.ir
 jibit.ir
 mydigipay.com
 app.mydigipay.com
-nextpay.org
 payping.io
 payping.ir
 api.payping.ir
@@ -101,7 +100,7 @@ bpm.shaparak.ir
 ecd.shaparak.ir
 fanava.shaparak.ir
 fcp.shaparak.ir
-#ikc.shaparak.ir
+ikc.shaparak.ir
 pec.shaparak.ir
 pep.shaparak.ir
 pna.shaparak.ir
