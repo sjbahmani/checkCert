@@ -95,7 +95,7 @@ bpm.shaparak.ir
 ecd.shaparak.ir
 fanava.shaparak.ir
 fcp.shaparak.ir
-ikc.shaparak.ir
+#ikc.shaparak.ir
 pec.shaparak.ir
 pep.shaparak.ir
 pna.shaparak.ir
