@@ -18,8 +18,9 @@ SHA-256 fingerprint:
 
 ## hosts-iran.txt
 
-A sample `--hosts-file` grouped by category, including banking, payments,
-capital markets, marketplaces, telecoms, crypto, cloud, domain registration,
+A sample `--hosts-file` grouped by category, including banking, payments and
+fintech (with API, gateway, and portal hosts), capital markets and brokerages,
+marketplaces, telecoms, crypto, cloud, domain registration,
 government, media, and messaging, with `google.com` and `msn.com` as
 non-Iranian baselines.
 Each category is sorted by domain, with subdomains immediately after their

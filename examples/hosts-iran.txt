@@ -75,14 +75,20 @@ modern.btt724.ir
 wepod.ir
 web.wepod.ir
 
-# Payments
+# Payments / fintech
 asanpardakht.ir
 behpardakht.ir
 bpmellat.ir
 digipay.ir
+www.faraboom.ir
+finnotech.ir
+jibit.ir
 mydigipay.com
 app.mydigipay.com
 nextpay.org
+payping.io
+payping.ir
+api.payping.ir
 paystar.ir
 my.paystar.ir
 pec.ir
@@ -102,12 +108,24 @@ pna.shaparak.ir
 sadad.shaparak.ir
 sep.shaparak.ir
 sepehr.shaparak.ir
+snapppay.ir
+portal.snapppay.ir
+tara360.ir
 torobpay.com
+vandar.io
+ipg.vandar.io
 zarinpal.com
 next.zarinpal.com
+payment.zarinpal.com
+zibal.ir
+gateway.zibal.ir
+panel.zibal.ir
 
 # Capital markets
+online.agah.com
 csdiran.ir
+www.emofid.com
+mofidonline.com
 sejam.ir
 
 # Marketplace / ride-hailing / e-commerce
