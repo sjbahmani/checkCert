@@ -9,7 +9,7 @@
 
 set -u -o pipefail
 
-VERSION=1.16.0
+VERSION=1.17.0
 verify_peer=1
 ca_file=
 ca_path=
@@ -605,7 +605,7 @@ crl_cache_lifetime_is_valid() {
 cache_object_is_valid() {
     local kind=$1 object=$2 verifier=$3 cert=${4:-} report=${5:-} is_ca=${6:-0}
     if [[ "$kind" == aia ]]; then
-        is_issuer_of_leaf "$object"
+        is_issuer_of_certificate "$object" "${cert:-$leaf}"
     elif [[ "$kind" == ocsp ]]; then
         ocsp_verify_response "$object" "$cert" "$verifier" "$report" "$is_ca" || return 1
         # Unknown responses are reported, but not retained as reusable evidence.
@@ -936,8 +936,9 @@ check_host_details() {
     local negotiated_protocol negotiated_cipher
     local leaf_text sig_alg pubkey_algo pubkey_bits key_usage_text
     local certificate_expired expiry_warning expiry_days_left end_date end_epoch
-    local leaf_issuer issuer_cert issuer_cn
+    local issuer_cert issuer_cn
     local -a issuer_urls=()
+    local -a aia_issuers=()
     local index issuer_candidate
     local chain_bundle
     local -a verify_args=() chain_only_args=()
@@ -1157,20 +1158,20 @@ check_host_details() {
         echo "Certificate validity: EXPIRED (or expires at the current time)" >&2
     fi
 
-    leaf_issuer=$(openssl x509 -in "$leaf" -noout -issuer -nameopt RFC2253 | sed 's/^issuer=//')
     issuer_cert=
-    is_issuer_of_leaf() {
-        local candidate=$1 candidate_subject
+    is_issuer_of_certificate() {
+        local candidate=$1 child=${2:-$leaf} candidate_subject expected_issuer
         candidate_subject=$(openssl x509 -in "$candidate" -noout -subject -nameopt RFC2253 2>/dev/null | sed 's/^subject=//')
-        [[ "$candidate_subject" == "$leaf_issuer" ]] || return 1
+        expected_issuer=$(certificate_issuer "$child")
+        [[ "$candidate_subject" == "$expected_issuer" ]] || return 1
         # A matching distinguished name alone is not enough: prove this key signed
-        # the leaf before using it to verify CRL or OCSP data.
-        openssl verify -partial_chain -CAfile "$candidate" "$leaf" >/dev/null 2>&1
+        # this child in isolation. This is not the final trust-store check.
+        openssl verify -partial_chain -trusted "$candidate" "$child" >/dev/null 2>&1
     }
 
     for cert in "$host_workdir"/cert-*.pem; do
         [[ "$cert" == "$leaf" ]] && continue
-        if is_issuer_of_leaf "$cert"; then issuer_cert=$cert; break; fi
+        if is_issuer_of_certificate "$cert"; then issuer_cert=$cert; break; fi
     done
 
     # Some servers omit intermediates.  Retrieve the issuing CA certificate from
@@ -1183,8 +1184,12 @@ check_host_details() {
         for index in "${!issuer_urls[@]}"; do
             issuer_candidate="$host_workdir/issuer-${index}.pem"
             if is_ldap_url "${issuer_urls[$index]}"; then continue; fi
-            if ! fetch_cached_object aia "${issuer_urls[$index]}" "$issuer_candidate"; then continue; fi
-            if is_issuer_of_leaf "$issuer_candidate"; then issuer_cert=$issuer_candidate; break; fi
+            if ! fetch_cached_object aia "${issuer_urls[$index]}" "$issuer_candidate" '' "$leaf"; then continue; fi
+            if is_issuer_of_certificate "$issuer_candidate"; then
+                issuer_cert=$issuer_candidate
+                aia_issuers+=("$issuer_candidate")
+                break
+            fi
         done
     fi
     [[ -n "$issuer_cert" ]] || echo "Warning: issuer certificate unavailable; CRL signatures cannot be verified." >&2
@@ -1212,7 +1217,7 @@ check_host_details() {
     find_presented_issuer() {
         local child=$1 expected_issuer=$2 candidate candidate_subject
         local -a candidates=("$host_workdir"/cert-*.pem)
-        [[ -n "$issuer_cert" ]] && candidates+=("$issuer_cert")
+        candidates+=("${aia_issuers[@]}")
         # Self-signed candidates are tried last: during a root rollover a
         # server can present a same-named self-signed root alongside a
         # cross-signed sibling that continues the chain to a root actually
@@ -1229,26 +1234,61 @@ check_host_details() {
                 self_signed_candidates+=("$candidate")
                 continue
             fi
-            if openssl verify -partial_chain -CAfile "$candidate" "$child" >/dev/null 2>&1; then
+            if openssl verify -partial_chain -trusted "$candidate" "$child" >/dev/null 2>&1; then
                 printf '%s\n' "$candidate"
                 return 0
             fi
         done
         for candidate in "${self_signed_candidates[@]}"; do
-            if openssl verify -partial_chain -CAfile "$candidate" "$child" >/dev/null 2>&1; then
+            if openssl verify -partial_chain -trusted "$candidate" "$child" >/dev/null 2>&1; then
                 printf '%s\n' "$candidate"
                 return 0
             fi
         done
         if [[ -n "${system_ca_subjects[$expected_issuer]:-}" ]]; then
             candidate=${system_ca_subjects[$expected_issuer]}
-            if openssl verify -partial_chain -CAfile "$candidate" "$child" >/dev/null 2>&1; then
+            if openssl verify -partial_chain -trusted "$candidate" "$child" >/dev/null 2>&1; then
                 printf '%s\n' "$candidate"
                 return 0
             fi
         fi
         return 1
     }
+
+    # Recover missing parents above the immediate issuer too (for example,
+    # YE1 -> cross-signed Root YE -> an already trusted ISRG root). Reuse
+    # presented/local/fetched issuers first, and bound cycles and chain depth.
+    local recovery_current=$issuer_cert recovery_parent recovery_fp recovery_depth
+    local -A recovery_seen=()
+    for (( recovery_depth = 1; recovery_depth < 9; recovery_depth++ )); do
+        [[ -n "$recovery_current" ]] || break
+        subj=$(certificate_subject "$recovery_current")
+        iss=$(certificate_issuer "$recovery_current")
+        [[ "$subj" != "$iss" ]] || break
+        recovery_fp=$(openssl x509 -in "$recovery_current" -noout -fingerprint -sha256)
+        [[ -z "${recovery_seen[$recovery_fp]:-}" ]] || break
+        recovery_seen[$recovery_fp]=1
+        if recovery_parent=$(find_presented_issuer "$recovery_current" "$iss"); then
+            recovery_current=$recovery_parent
+            continue
+        fi
+        mapfile -t issuer_urls < <(
+            openssl x509 -in "$recovery_current" -noout -ext authorityInfoAccess 2>/dev/null \
+                | grep -oE 'CA Issuers - URI:[^,[:space:]]+' | sed 's/^CA Issuers - URI://' | sort -u
+        )
+        recovery_parent=
+        for index in "${!issuer_urls[@]}"; do
+            is_ldap_url "${issuer_urls[$index]}" && continue
+            issuer_candidate="$host_workdir/issuer-chain-$recovery_depth-$index.pem"
+            if fetch_cached_object aia "${issuer_urls[$index]}" "$issuer_candidate" '' "$recovery_current" \
+                && is_issuer_of_certificate "$issuer_candidate" "$recovery_current"; then
+                aia_issuers+=("$issuer_candidate")
+                recovery_parent=$issuer_candidate
+                break
+            fi
+        done
+        recovery_current=$recovery_parent
+    done
 
     # s_client does not validate the server certificate by default. A CRL signed by
     # an untrusted CA is not enough, so always validate the chain and identity.
@@ -1271,9 +1311,11 @@ check_host_details() {
             fi
             awk '{ print }' "$cert" >> "$chain_bundle"
         done
-        # The server may omit intermediates; if one was recovered via AIA above,
-        # include it too so chain verification is not penalized for that omission.
-        [[ -n "$issuer_cert" ]] && awk '{ print }' "$issuer_cert" >> "$chain_bundle"
+        # Recovered certificates are untrusted chain material, never anchors.
+        for cert in "${aia_issuers[@]}"; do
+            [[ "$(certificate_subject "$cert")" != "$(certificate_issuer "$cert")" ]] || continue
+            cat "$cert" >> "$chain_bundle"
+        done
         verify_args=(-purpose sslserver)
         if (( is_ip == 1 )); then
             verify_args+=(-verify_ip "$connection_host")
@@ -1530,7 +1572,7 @@ check_host_details() {
             fi
             if [[ "$parent" == "$host_workdir"/cert-*.pem ]]; then
                 source_suffix=' [PRESENTED]'
-            elif [[ -n "$issuer_cert" && "$parent" == "$issuer_cert" ]]; then
+            elif [[ "$parent" == "$host_workdir"/issuer-*.pem ]]; then
                 source_suffix=' [FETCHED VIA AIA]'
             else
                 source_suffix=' [FROM LOCAL TRUST STORE]'

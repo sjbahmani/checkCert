@@ -887,4 +887,5 @@ assert_output "unavailable locking is explained" \
 echo
 echo "Functional tests: $pass passed, $fail failed."
 (( fail == 0 )) || exit 1
-bash "$script_dir/ocsp_cache.sh"
+bash "$script_dir/ocsp_cache.sh" || exit 1
+bash "$script_dir/aia_chain.sh"

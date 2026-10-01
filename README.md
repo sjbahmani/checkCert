@@ -152,7 +152,10 @@ runs, choose a persistent directory:
 Each cache hit is revalidated. A CRL must verify against the certificate's
 actual issuer, have `nextUpdate` strictly after `lastUpdate`, and still be
 before `nextUpdate`; clock-skew tolerance never extends its cache lifetime.
-An AIA certificate must match the expected issuer and verify the leaf. The
+An AIA certificate must match the expected issuer and verify its child. Missing
+issuers are recovered up the chain, including cross-signed roots, with cycle
+detection and a ten-certificate depth limit. Presented and local issuers are
+reused before downloading missing parents. The
 normal trust-store, identity, expiry, and revocation checks still run: cached
 issuers are **not** added to the trust store, and a CRL is checked separately
 against every certificate's serial number. Whole-host verdicts are never cached.
@@ -502,6 +505,7 @@ shellcheck -s bash checkCRT.sh tests/test_cli.sh tests/functional/*.sh
 ./tests/test_cli.sh          # CLI parsing/validation, no network
 ./tests/functional/run.sh    # end-to-end against a local throwaway PKI
 bash tests/functional/ocsp_cache.sh  # OCSP-only cache regressions (also run above)
+bash tests/functional/aia_chain.sh   # recursive AIA recovery (also run above)
 ```
 
 `tests/functional/run.sh` builds a disposable root CA, two intermediates, and
@@ -521,6 +525,8 @@ disposable CA, counts HTTP requests, and tests cache identity isolation,
 signature/freshness rejection, missing `nextUpdate`, and revoked intermediates.
 Its clock shim exercises time limits without changing the system clock or
 requiring Python. All JSON assertions still use `jq`.
+The AIA suite covers multiple missing issuers, cross-signed roots, cached reuse
+during an HTTP outage, wrong-key rejection, and refusal to trust downloaded roots.
 It binds local TCP ports, so it needs permission
 to do so in restricted/sandboxed environments; it makes no real network
 requests.

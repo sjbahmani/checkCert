@@ -36,6 +36,8 @@ errors — CI fails on warnings too).
   verification, outages, and parallel reuse. The entry point also runs
   `ocsp_cache.sh`, which can be run independently with Bash and uses a local
   CGI responder to test signed OCSP responses and count actual HTTP requests.
+  It also runs `aia_chain.sh` for recursive issuer recovery, cross-signed
+  roots, cached chain reuse, and rejection of untrusted or wrong-key parents.
   It makes no real network
   requests, but it does bind local TCP ports, so in a sandboxed environment
   you may need to grant permission for that.

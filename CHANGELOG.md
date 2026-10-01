@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.17.0
+
+- Recover missing issuer certificates through AIA beyond the leaf's immediate
+  issuer, including cross-signed root links. Revalidate each cached/downloaded
+  issuer against its child, bound recovery depth and cycles, and use recovered
+  certificates only as untrusted chain material. Final trust still requires
+  an existing local trust anchor.
+
 ## 1.16.0
 
 - Align wget with curl: one client attempt per retry, configured connection

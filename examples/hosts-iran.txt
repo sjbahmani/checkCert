@@ -51,7 +51,7 @@ edbi.ir
 bim.ir
 day24.ir
 bank-day.ir
-ebank.bank-day.ir
+ebank.day24.ir
 sbank.ir
 sinabank.ir
 shahr-bank.ir
