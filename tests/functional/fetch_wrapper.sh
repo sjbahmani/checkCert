@@ -8,6 +8,21 @@ network_rc=7 http_rc=22
 if [[ ${0##*/} == wget && -n ${CHECKCRT_TEST_WGET_ARGS:-} ]]; then
     printf '%s\n' "$@" > "$CHECKCRT_TEST_WGET_ARGS"
 fi
+if [[ ${CHECKCRT_TEST_FORCE_TIMEOUT:-0} == 1 ]]; then
+    # Include partial bytes to prove they cannot be accepted as Axel output.
+    output=
+    args=("$@")
+    for ((i=0; i<${#args[@]}; i++)); do
+        case "${args[$i]}" in
+            --output) output=${args[$((i+1))]} ;;
+            --output-document=*) output=${args[$i]#*=} ;;
+        esac
+    done
+    [[ -z "$output" ]] || printf 'partial ordinary-client download\n' > "$output"
+    echo 'Operation timed out (fixture)' >&2
+    [[ ${0##*/} != wget ]] || exit 4
+    exit 28
+fi
 if [[ -n "${CHECKCRT_TEST_HTTP_STATUS:-}" ]]; then
     if [[ ${0##*/} == wget ]]; then
         printf '  HTTP/1.1 %s Fixture response\n' "$CHECKCRT_TEST_HTTP_STATUS" >&2

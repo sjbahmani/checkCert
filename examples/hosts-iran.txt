@@ -16,8 +16,10 @@
 ib.agri-bank.com
 baambank.ir
 bank-day.ir
+ebank.bank-day.ir
 bank-keshavarzi.com
 bank-maskan.ir
+ibn.bank-maskan.ir
 bank-melli.ir
 bankino.digital
 bankmellat.ir
@@ -31,6 +33,7 @@ vbank.bpi.ir
 bsi.ir
 ib.bsi.ir
 day24.ir
+ebank.bdi24.org
 ebank.day24.ir
 edbi.ir
 enbank.ir
@@ -67,7 +70,10 @@ ibank.tourism-bank.com
 tourismbank.ir
 vbank.tourismbank.ir
 ttbank.ir
+btt724.ir
+modern.btt724.ir
 wepod.ir
+web.wepod.ir
 
 # Payments
 asanpardakht.ir

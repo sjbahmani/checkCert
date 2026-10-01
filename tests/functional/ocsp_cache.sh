@@ -323,5 +323,22 @@ check_exit 'cached intermediate revocation remains enforced offline' 2 \
 assert 'cached revoked intermediate needs no HTTP requests' requests 0
 assert 'cached intermediate revocation preserves JSON' json_matches '.[0].intermediate_revoked == true'
 
+# Timeout fallback is GET-only: never replace a signed OCSP POST with Axel.
+mkdir "$fixture_dir/axel-post-bin"
+cp "$script_dir/fetch_wrapper.sh" "$fixture_dir/axel-post-bin/curl"
+cp "$script_dir/axel_wrapper.sh" "$fixture_dir/axel-post-bin/axel"
+chmod +x "$fixture_dir/axel-post-bin/"*
+: > "$fixture_dir/post-fetch.log"
+: > "$fixture_dir/post-axel.log"
+check_exit 'OCSP timeouts never use Axel' 3 \
+    env PATH="$fixture_dir/axel-post-bin:$PATH" CHECKCRT_TEST_FORCE_TIMEOUT=1 \
+    CHECKCRT_TEST_FETCH_LOG="$fixture_dir/post-fetch.log" CHECKCRT_AXEL_LOG="$fixture_dir/post-axel.log" \
+    CHECKCRT_AXEL_ARGS="$fixture_dir/post-axel.args" CHECKCRT_AXEL_MODE=failure \
+    "$check" "${args[@]}" --no-proxy '*' --no-cache --connect-retries 1 --retry-delay 0 \
+    --json 127.0.0.1 "$good_port"
+assert 'OCSP POSTs keep their configured curl retry count' test "$(wc -l < "$fixture_dir/post-fetch.log")" -eq 4
+assert 'OCSP POST never calls installed Axel' test ! -s "$fixture_dir/post-axel.log"
+assert 'timed-out OCSP responses remain unknown' json_matches '.[0].revocation == "UNKNOWN"'
+
 printf '\nOCSP cache tests: %s passed, %s failed.\n' "$pass" "$fail"
 (( fail == 0 ))

@@ -501,6 +501,7 @@ without_curl() (
     # shellcheck disable=SC2329
     command() {
         if [[ "$*" == '-v curl' ]]; then return 1; fi
+        if [[ "$*" == '-v axel' && ${CHECKCRT_TEST_DISABLE_AXEL:-0} == 1 ]]; then return 1; fi
         builtin command "$@"
     }
     export -f command
@@ -542,7 +543,7 @@ if command -v wget >/dev/null; then
     : > "$CHECKCRT_TEST_FETCH_LOG"
     check_exit "wget enforces the total request deadline" 3 \
         without_curl env PATH="$PKI_DIR/wget-bin:$PATH" CHECKCRT_TEST_FETCH_DELAY=3 \
-        CHECKCRT_TEST_WGET_ARGS="$PKI_DIR/wget.args" CHECKCRT_TEST_FETCH_BIN="$actual_wget" \
+        CHECKCRT_TEST_WGET_ARGS="$PKI_DIR/wget.args" CHECKCRT_TEST_FETCH_BIN="$actual_wget" CHECKCRT_TEST_DISABLE_AXEL=1 \
         "$check" "${cache_args[@]}" --no-cache --request-timeout 1 --connect-retries 1 \
         --json 127.0.0.1 "$GOOD_PORT"
     assert_output "wget timeout uses exactly the configured attempts" fetch_count_is 2
@@ -945,4 +946,5 @@ echo
 echo "Functional tests: $pass passed, $fail failed."
 (( fail == 0 )) || exit 1
 bash "$script_dir/ocsp_cache.sh" || exit 1
-bash "$script_dir/aia_chain.sh"
+bash "$script_dir/aia_chain.sh" || exit 1
+bash "$script_dir/axel_fallback.sh"

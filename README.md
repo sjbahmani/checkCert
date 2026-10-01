@@ -19,6 +19,10 @@ GNU `stat` to check directory permissions. Cache file operations use standard
 GNU coreutils (`cp`, `mv`, and `mkdir`); no additional service or runtime JSON
 tool is needed.
 
+Optional `axel` enables parallel CRL/AIA downloading after a curl/wget timeout
+(`sudo apt-get install axel` on Debian/Ubuntu). It is not required for normal
+operation.
+
 ## Usage
 
 ```bash
@@ -418,6 +422,22 @@ object. Verification, other objects, and shared-cache lock waits can add time.
 There is no overall per-domain deadline; use `--connect-retries` to reduce
 the retry budget when faster failure reporting is needed.
 
+After a direct HTTP(S) CRL/AIA download times out, remaining retries use
+`axel -n 10` when installed. Each Axel attempt retains the total
+`--request-timeout` deadline (plus a 1-second termination grace), passes
+`--connect-timeout` to Axel's `-T` setting, and stays under the same cache
+lock. Only Axel's own partial file/state is resumed; a successful download
+still requires the usual certificate/CRL validation before caching. All
+attempts count as one cache miss for the object. Servers without byte-range
+support may offer no speedup. `--connect-retries 0` disables the fallback.
+
+OCSP POSTs keep curl/wget. When a proxy is configured by flags or environment,
+curl/wget are retained to preserve routing and bypass rules; an explicit
+`--no-proxy '*'` permits direct Axel use. Without Axel, normal retries continue.
+Only an Axel deadline expiry is retried; other Axel errors stop because Axel
+does not expose reliable HTTP-status exit codes. Its internal reconnections
+remain bounded by the outer request deadline.
+
 Curl and wget both use one client attempt per retry. Wget applies
 `--connect-timeout` to DNS/connect operations, `--request-timeout` to reads,
 and an outer deadline to enforce the total request timeout.
@@ -498,12 +518,13 @@ the local system store.
 
 ## Development
 
-Tests additionally require `jq` for JSON/NDJSON assertions and BusyBox with the
-`httpd` applet for the local HTTP fixture. Install ShellCheck for linting too.
+Tests additionally require `jq` for JSON/NDJSON assertions, BusyBox with the
+`httpd` applet for the local HTTP fixture, and curl, wget, and Axel for transport
+regressions. Install ShellCheck for linting too.
 On Debian/Ubuntu:
 
 ```bash
-sudo apt-get install jq busybox-static shellcheck
+sudo apt-get install jq busybox-static curl wget axel shellcheck
 ```
 
 These are development dependencies; running `checkCRT.sh` does not require
@@ -516,6 +537,7 @@ shellcheck -s bash checkCRT.sh tests/test_cli.sh tests/functional/*.sh
 ./tests/functional/run.sh    # end-to-end against a local throwaway PKI
 bash tests/functional/ocsp_cache.sh  # OCSP-only cache regressions (also run above)
 bash tests/functional/aia_chain.sh   # recursive AIA recovery (also run above)
+bash tests/functional/axel_fallback.sh  # timeout fallback and shared downloads
 ```
 
 `tests/functional/run.sh` builds a disposable root CA, two intermediates, and
@@ -539,6 +561,8 @@ Its clock shim exercises time limits without changing the system clock or
 requiring Python. All JSON assertions still use `jq`.
 The AIA suite covers multiple missing issuers, cross-signed roots, cached reuse
 during an HTTP outage, wrong-key rejection, and refusal to trust downloaded roots.
+The Axel suite forces curl/wget timeouts, then performs real local Axel downloads
+and checks retry budgets, signature rejection, cache reuse, and parallel locking.
 It binds local TCP ports, so it needs permission
 to do so in restricted/sandboxed environments; it makes no real network
 requests.

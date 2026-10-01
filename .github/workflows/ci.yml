@@ -20,7 +20,7 @@ jobs:
       - name: Install functional test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq busybox-static
+          sudo apt-get install -y jq busybox-static curl wget axel
       - name: Run functional tests (local PKI, no network required)
         run: |
           openssl version -a

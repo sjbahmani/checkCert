@@ -9,7 +9,7 @@
 
 set -u -o pipefail
 
-VERSION=1.18.0
+VERSION=1.19.0
 verify_peer=1
 ca_file=
 ca_path=
@@ -65,6 +65,8 @@ Options:
   --no-cache          Disable cache reads and writes, including --cache-dir.
   --connect-timeout N TLS connection timeout in seconds (default: 5).
   --request-timeout N CRL/OCSP request timeout in seconds (default: 60).
+                      Timed-out direct CRL/AIA downloads retry with axel -n 10
+                      when installed; retries share the same attempt budget.
   --connect-retries N Retry a failed network operation (initial TLS
                       connection, CRL download, or OCSP query) up to N
                       extra times (default: 6; 0 disables retrying).
@@ -472,13 +474,32 @@ retry_wait() {
 fetch() {
     local url=$1 destination=$2 request=${3:-} operation=${4:-Download}
     local fetch_attempt=0 fetch_rc http_status retryable errors="$2.errors"
+    local timed_out use_axel=0 axel_destination="$2.axel"
     local -a curl_args wget_args
     fetch_failure_shared=0
     while :; do
         retryable=0
+        timed_out=0
         fetch_failure_shared=0
         http_status=
-        if command -v curl >/dev/null 2>&1; then
+        if (( use_axel == 1 )); then
+            # Separate output avoids treating curl/wget's partial bytes as a
+            # complete file or an Axel resume file. Later Axel attempts reuse
+            # only its own state, within this same locked object fetch.
+            if timeout -k 1 "$request_timeout" axel -q -n 10 -T "$connect_timeout" -N \
+                -o "$axel_destination" "$url" >&2; then
+                [[ -s "$axel_destination" ]] || return 1
+                mv -f -- "$axel_destination" "$destination" || return 1
+                return 0
+            else fetch_rc=$?; fi
+            printf 'Axel download failed (exit %s).\n' "$fetch_rc" >&2
+            # Axel has no stable HTTP-status exit codes. Only an outer
+            # deadline is a known temporary failure; do not retry other errors.
+            if (( fetch_rc == 124 || fetch_rc == 137 )); then
+                retryable=1
+                fetch_failure_shared=1
+            fi
+        elif command -v curl >/dev/null 2>&1; then
             curl_args=(--fail --location --silent --show-error --retry 0 --connect-timeout "$connect_timeout" --max-time "$request_timeout")
             [[ -n "$proxy" ]] && curl_args+=(--proxy "$proxy")
             [[ -n "$no_proxy" ]] && curl_args+=(--noproxy "$no_proxy")
@@ -488,6 +509,7 @@ fetch() {
             fi
             if http_status=$(curl "${curl_args[@]}" --write-out '%{http_code}' --output "$destination" "$url"); then return 0
             else fetch_rc=$?; fi
+            (( fetch_rc != 28 )) || timed_out=1
             case "$fetch_rc" in
                 5|6|7|16|18|28|52|55|56|92) retryable=1; fetch_failure_shared=1 ;;
                 22)
@@ -506,6 +528,7 @@ fetch() {
             fi
             if timeout "$request_timeout" wget "${wget_args[@]}" "$url" 2>"$errors"; then return 0
             else fetch_rc=$?; fi
+            if (( fetch_rc == 124 )) || { (( fetch_rc == 4 )) && LC_ALL=C grep -qi 'timed out' "$errors"; }; then timed_out=1; fi
             cat "$errors" >&2
             http_status=$(http_status_from_report "$errors")
             case "$fetch_rc" in
@@ -520,6 +543,19 @@ fetch() {
         fi
         (( retryable == 1 )) || return 1
         (( fetch_attempt >= connect_retries )) && return 1
+        if (( use_axel == 0 && timed_out == 1 )) && [[ -z "$request" && "$url" =~ ^https?:// ]] \
+            && command -v axel >/dev/null 2>&1; then
+            # Axel proxy/bypass matching differs from curl/wget. Keep those
+            # clients when proxy routing is configured; -N also prevents an
+            # unrelated axelrc proxy from changing a direct request's route.
+            if [[ "$no_proxy" == '*' ]] \
+                || [[ -z "$proxy${http_proxy:-}${HTTP_PROXY:-}${https_proxy:-}${HTTPS_PROXY:-}${all_proxy:-}${ALL_PROXY:-}" ]]; then
+                use_axel=1
+                echo 'Download timed out; switching to axel -n 10 for remaining retries.' >&2
+            else
+                echo 'Axel fallback skipped to preserve configured proxy routing.' >&2
+            fi
+        fi
         fetch_attempt=$((fetch_attempt + 1))
         retry_wait "$fetch_attempt" "$operation"
     done

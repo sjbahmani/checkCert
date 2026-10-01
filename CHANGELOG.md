@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.19.0
+
+- Switch timed-out direct CRL/AIA downloads to optional `axel -n 10` for
+  remaining retries. Keep the request deadline, shared-cache lock, retry
+  budget, and cryptographic verification. Axel retries can resume its own
+  partial download; curl/wget partial data is never mistaken for a complete
+  file. OCSP POSTs and proxy-configured downloads retain curl/wget.
+
 ## 1.18.0
 
 - Bound CAA DNS lookups to 5 seconds, with a 1-second forced-kill grace period.

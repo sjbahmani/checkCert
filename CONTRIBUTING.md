@@ -7,8 +7,8 @@ status handling, option parsing, revocation/trust logic, or output format
 ## Before opening a pull request
 
 Install the test dependencies listed in the README: `jq` for JSON assertions,
-BusyBox with `httpd` (e.g. `busybox-static`) for the HTTP fixture, and ShellCheck
-for linting. Python is not required.
+BusyBox with `httpd` (e.g. `busybox-static`) for the HTTP fixture, curl/wget/Axel
+for transport regressions, and ShellCheck for linting. Python is not required.
 
 Run the full check locally — this is exactly what CI (`.github/workflows/ci.yml`)
 runs on every push and pull request:
@@ -40,6 +40,8 @@ errors — CI fails on warnings too).
   CGI responder to test signed OCSP responses and count actual HTTP requests.
   It also runs `aia_chain.sh` for recursive issuer recovery, cross-signed
   roots, cached chain reuse, and rejection of untrusted or wrong-key parents.
+  `axel_fallback.sh` checks real accelerated downloads after simulated timeouts,
+  bounded retries, and shared-cache behavior.
   It makes no real network
   requests, but it does bind local TCP ports, so in a sandboxed environment
   you may need to grant permission for that.
