@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.18.0
+
+- Bound CAA DNS lookups to 5 seconds, with a 1-second forced-kill grace period.
+  Report lookup failures as UNKNOWN with an advisory warning, and distinguish
+  them from successful answers without CAA records. Stop implying that a
+  hostname without its own CAA records has no inherited issuance restrictions.
+- Correct retry help to describe the actual 1, 1, 2, 2, 4, 6-second waits.
+- Increase the default connection timeout from 2 to 5 seconds to allow more
+  time for TLS handshakes and reduce retries on slower connections. The
+  request timeout remains 60 seconds; `--connect-timeout` still overrides
+  the default for TLS connections and HTTP downloads.
+
 ## 1.17.0
 
 - Recover missing issuer certificates through AIA beyond the leaf's immediate

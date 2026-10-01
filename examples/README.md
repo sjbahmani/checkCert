@@ -18,9 +18,13 @@ SHA-256 fingerprint:
 
 ## hosts-iran.txt
 
-A sample `--hosts-file` covering a few major Iranian banks, marketplaces,
-telecoms, and media sites, plus `google.com` as a non-Iranian baseline. Pair
-it with the CA file above so `bankmellat.ir` resolves as trusted too:
+A sample `--hosts-file` grouped by category, including banking, payments,
+capital markets, marketplaces, telecoms, crypto, cloud, domain registration,
+government, media, and messaging, with `google.com` and `msn.com` as
+non-Iranian baselines.
+Each category is sorted by domain, with subdomains immediately after their
+parent domain when listed. Commented-out hosts remain disabled. Pair it with
+the CA file above so `bankmellat.ir` resolves as trusted too:
 
 ```bash
 ./checkCRT.sh --ca-file examples/iran-root-ca.pem --hosts-file examples/hosts-iran.txt

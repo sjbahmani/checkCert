@@ -1,5 +1,5 @@
 # Sample --hosts-file for checkCRT.sh: a mix of Iranian banks/services and
-# one non-Iranian baseline (google.com) for comparison.
+# non-Iranian baselines for comparison.
 #   ./checkCRT.sh --hosts-file examples/hosts-iran.txt
 #   ./checkCRT.sh --json --hosts-file examples/hosts-iran.txt   # NDJSON
 #
@@ -10,150 +10,173 @@
 # Some domestic sites respond slowly from outside their network; if you see
 # connection failures, retry with a longer --connect-timeout (e.g. 30).
 # Edit or trim this list for your own monitoring needs.
+# Grouped by category; sorted by domain, with subdomains after their parent.
 
 # Banking
-bankmellat.ir
-mellat.ir
-ebanking.mellat.ir
-bpmellat.ir
-bmi.ir
-sb24.ir
-banksepah.ir
-sphbank.ir
-ebank.sphbank.ir
-bsi.ir
-ib.bsi.ir
-bank-maskan.ir
-tejaratbank.ir
-ib.tejaratbank.ir
-postbank.ir
-#refah-bank.ir
-rb24.ir
-parsian-bank.ir
-bank-melli.ir
+ib.agri-bank.com
 baambank.ir
-sb24.com
-ib.sb24.com
+bank-day.ir
+bank-keshavarzi.com
+bank-maskan.ir
+bank-melli.ir
+bankino.digital
+bankmellat.ir
+banksepah.ir
+bim.ir
+#bki.ir
+blubank.com
+bmi.ir
 bpi.ir
 vbank.bpi.ir
-wepod.ir
-middleeastbank.ir
-bankino.digital
-blubank.com
+bsi.ir
+ib.bsi.ir
+day24.ir
+ebank.day24.ir
+edbi.ir
 enbank.ir
+modern.enbank.ir
 iparsian724.ir
 ipb.iparsian724.ir
+izbank.ir
+getapp.izbank.ir
+karafarinbank.ir
+mellat.ir
+ebanking.mellat.ir
+middleeastbank.ir
 omidbank.ir
-bki.ir
-bank-keshavarzi.com
-ttbank.ir
-edbi.ir
-bim.ir
-day24.ir
-bank-day.ir
-ebank.day24.ir
-sbank.ir
-sinabank.ir
-shahr-bank.ir
+parsian-bank.ir
+postbank.ir
+rb24.ir
+ib.rb24.ir
 red-bank.ir
-rqbank.ir
+#refah-bank.ir
 vbank.rqb.ir
-tourismbank.ir
+rqbank.ir
+sb24.com
+ib.sb24.com
+sb24.ir
+sbank.ir
+ib.sbank.ir
+shahr-bank.ir
+sinabank.ir
+sphbank.ir
+ebank.sphbank.ir
+tejaratbank.ir
+ib.tejaratbank.ir
 ibank.tourism-bank.com
+tourismbank.ir
 vbank.tourismbank.ir
-shaparak.ir
-sep.shaparak.ir
-sadad.shaparak.ir
-bpm.shaparak.ir
-pec.shaparak.ir
-asan.shaparak.ir
-pep.shaparak.ir
-ikc.shaparak.ir
-fcp.shaparak.ir
-fanava.shaparak.ir
-pna.shaparak.ir
-sepehr.shaparak.ir
-ecd.shaparak.ir
+ttbank.ir
+wepod.ir
 
-behpardakht.ir
-sadadpsp.ir
+# Payments
 asanpardakht.ir
+behpardakht.ir
+bpmellat.ir
+digipay.ir
+mydigipay.com
+app.mydigipay.com
+nextpay.org
+paystar.ir
+my.paystar.ir
 pec.ir
-sep.ir
 pep.co.ir
+sadadpsp.ir
+sep.ir
+shaparak.ir
+asan.shaparak.ir
+bpm.shaparak.ir
+ecd.shaparak.ir
+fanava.shaparak.ir
+fcp.shaparak.ir
+ikc.shaparak.ir
+pec.shaparak.ir
+pep.shaparak.ir
+pna.shaparak.ir
+sadad.shaparak.ir
+sep.shaparak.ir
+sepehr.shaparak.ir
+torobpay.com
+zarinpal.com
+next.zarinpal.com
 
-
+# Capital markets
+csdiran.ir
+sejam.ir
 
 # Marketplace / ride-hailing / e-commerce
-divar.ir
-tapsi.ir
-snapp.ir
 digikala.com
+divar.ir
+snapp.ir
+tapsi.ir
+torob.com
 
 # Telecom
 irancell.ir
 mci.ir
+shatel.ir
+register.shatel.ir
 
-# Crypto exchanges
+# Crypto exchanges / information
+arzdigital.com
 bitpin.ir
-wallex.ir
-nobitex.ir
 exir.io
+nobitex.ir
+ok-ex.io
 ramzinex.com
 tabdeal.org
-ok-ex.io
 tetherland.com
-arzdigital.com
+wallex.ir
 
 # Cloud providers
 arvancloud.ir
 sotoon.ir
 
+# Domain registry
+nic.ir
+
 # Government
-dolat.ir
-president.ir
-mfa.ir
-cbi.ir
-www.parliran.ir
-irica.ir
-irica.gov.ir
-ntsw.ir
-sso.my.gov.ir
-iran.gov.ir
-tax.gov.ir
-intamedia.ir
 adliran.ir
-eadl.ir
 behdasht.gov.ir
+cbi.ir
+dolat.ir
+eadl.ir
+intamedia.ir
+iran.gov.ir
+irica.gov.ir
+irica.ir
 my.medu.ir
-iribonline.ir
+mfa.ir
+sso.my.gov.ir
+ntsw.ir
+www.parliran.ir
+president.ir
 tamin.ir
-sejam.ir
-csdiran.ir
+tax.gov.ir
 
 # Media / news
 aparat.com
-varzesh3.com
-irna.ir
-farsnews.ir
-mehrnews.com
-yjc.ir
 asriran.com
+farsnews.ir
+filimo.com
+iribonline.ir
+irna.ir
+mehrnews.com
 telewebion.ir
 telewebion.net
+varzesh3.com
+yjc.ir
 
-#Messenger
-ble.ir
+# Messaging
 web.bale.ai
+ble.ir
 eitaa.com
 rubika.ir
 shad.ir
 my.shad.ir
-web.splus.ir
 soroushplus.com
+web.splus.ir
 
-
-
-# Baseline (non-Iranian, for comparison)
+# Baselines (non-Iranian, for comparison)
 google.com
 msn.com

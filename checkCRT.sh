@@ -9,7 +9,7 @@
 
 set -u -o pipefail
 
-VERSION=1.17.0
+VERSION=1.18.0
 verify_peer=1
 ca_file=
 ca_path=
@@ -22,7 +22,7 @@ cache_enabled=1
 cache_dir=
 cache_dir_set=0
 cache_max_age=86400
-connect_timeout=2
+connect_timeout=5
 request_timeout=60
 connect_retries=6
 retry_delay=1
@@ -63,14 +63,15 @@ Options:
                       24 hours).
                       CRL/OCSP entries are never reused past nextUpdate.
   --no-cache          Disable cache reads and writes, including --cache-dir.
-  --connect-timeout N TLS connection timeout in seconds (default: 2).
+  --connect-timeout N TLS connection timeout in seconds (default: 5).
   --request-timeout N CRL/OCSP request timeout in seconds (default: 60).
   --connect-retries N Retry a failed network operation (initial TLS
                       connection, CRL download, or OCSP query) up to N
                       extra times (default: 6; 0 disables retrying).
                       Only temporary transport/HTTP failures are retried.
   --retry-delay N     Initial retry delay in seconds (default: 1; 0 disables
-                      waiting). Doubles each retry, capped at 6 seconds.
+                      waiting). Default waits: 1, 1, 2, 2, 4, 6 seconds;
+                      scaled by this value, with a 6-second cap.
   --max-ocsp-age N    Maximum OCSP response age in seconds (default: 86400
                       for leaf/no-nextUpdate responses). CA responses with
                       nextUpdate use its signed deadline unless N is set.
@@ -85,7 +86,7 @@ Options:
   --fail-on-expiry-warning
                       Exit 6 instead of 0 when only the expiry warning
                       applies (chain trusted, not revoked, not expired).
-  --no-caa            Skip the DNS CAA record lookup.
+  --no-caa            Skip the DNS CAA lookup (5-second deadline).
   --hosts-file FILE   Check every "host [port]" line in FILE instead of a
                       single positional host/port. Blank lines and lines
                       starting with # are ignored. Other options (CA trust,
@@ -951,7 +952,7 @@ check_host_details() {
     local checked=0 revoked=0 ocsp_good=0
     local rc_checked rc_revoked rc_ocsp_good
     local trust_status expiry_status revocation_status overall_status exit_code reason
-    local caa_records
+    local caa_records caa_output caa_rc caa_status caa_problem
 
     if ! host_workdir=$(mktemp -d "$workdir/host.XXXXXX"); then
         emit_error_json "$domain" "$port" "unable to create host working directory"
@@ -1377,16 +1378,45 @@ check_host_details() {
         echo "CAA status: skipped (no dig, host, or nslookup available)."
     else
         caa_records=
+        caa_problem=
+        caa_rc=0
+        # Capture the resolver exit status before parsing. An empty answer
+        # alone cannot distinguish NODATA from DNS/transport failure.
+        # The extra kill grace also bounds a resolver that ignores SIGTERM.
         case "$caa_tool" in
-            dig) caa_records=$(dig +short CAA "$connection_host" 2>/dev/null) ;;
-            host) caa_records=$(host -t CAA "$connection_host" 2>/dev/null | grep -i 'CAA' || true) ;;
-            nslookup) caa_records=$(nslookup -type=CAA "$connection_host" 2>/dev/null | grep -i 'CAA' || true) ;;
+            dig) caa_output=$(LC_ALL=C timeout -k 1 5 dig +noall +comments +answer CAA "$connection_host" 2>&1) || caa_rc=$? ;;
+            host) caa_output=$(LC_ALL=C timeout -k 1 5 host -t CAA "$connection_host" 2>&1) || caa_rc=$? ;;
+            nslookup) caa_output=$(LC_ALL=C timeout -k 1 5 nslookup -type=CAA "$connection_host" 2>&1) || caa_rc=$? ;;
         esac
-        if [[ -n "$caa_records" ]]; then
+        if (( caa_rc == 124 || caa_rc == 137 )); then
+            caa_problem='lookup timed out (5-second deadline)'
+        elif (( caa_rc != 0 )); then
+            caa_problem="lookup failed (resolver exit $caa_rc)"
+        elif [[ "$caa_tool" == dig ]]; then
+            caa_status=$(sed -n 's/.*status: \([A-Z0-9]*\),.*/\1/p' <<<"$caa_output" | tail -1)
+            if [[ "$caa_status" != NOERROR ]]; then
+                caa_problem="lookup failed (DNS status ${caa_status:-unavailable})"
+            else
+                caa_records=$(awk '$4 == "CAA" { match($0, /[[:space:]]CAA[[:space:]]+/); print substr($0, RSTART + RLENGTH) }' <<<"$caa_output")
+            fi
+        else
+            # host/nslookup use presentation text; only explicit record lines
+            # or a successful, explicit NODATA answer are accepted.
+            caa_records=$(sed -n -E 's/^.*has CAA record[[:space:]]+//p; s/^.*[[:space:]](caa|CAA|rdata_257)[[:space:]]*=[[:space:]]*//p' <<<"$caa_output")
+            if grep -Eqi 'SERVFAIL|REFUSED|NXDOMAIN|timed out|no servers could be reached' <<<"$caa_output"; then
+                caa_problem='lookup failed (DNS error)'
+            elif [[ -z "$caa_records" ]] && ! grep -Eqi 'has no CAA record|No answer' <<<"$caa_output"; then
+                caa_problem='lookup failed (unrecognized DNS response)'
+            fi
+        fi
+        if [[ -n "$caa_problem" ]]; then
+            echo "CAA status: UNKNOWN ($caa_problem)."
+            add_warning "CAA lookup for $connection_host: $caa_problem; CAA policy is unknown."
+        elif [[ -n "$caa_records" ]]; then
             echo "CAA record(s) at $connection_host:"
             printf '  %s\n' "$caa_records"
         else
-            echo "CAA status: no CAA record found at $connection_host (parent domains not walked; any CA may issue)."
+            echo "CAA status: no CAA record found at $connection_host (parent domains not walked; inherited policy not checked)."
         fi
     fi
 

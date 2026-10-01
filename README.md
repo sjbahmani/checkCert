@@ -337,7 +337,10 @@ non-fatal `ADVISORY WARNINGS` list (and the JSON `warnings` array):
   `dig`, `host`, or `nslookup` (whichever is available); skipped for IP
   targets, when none of those tools are present, or with `--no-caa`. Parent
   domains are not walked, so an empty result is not proof that any CA may
-  issue.
+  issue. Each lookup has a fixed 5-second deadline, with a 1-second forced-kill
+  grace period. Timeouts, DNS failures, and unrecognized responses report
+  `UNKNOWN` and add an advisory warning (also present in JSON); they never
+  become a claim that no CAA policy exists. CAA lookups are not retried.
 
 These checks are informational: they never change `TRUST`, `REVOCATION`, or
 the exit code, since browsers and CAs vary in how strictly they enforce them.
@@ -388,8 +391,8 @@ CRL. Skipped checks supply no revocation evidence.
 
 Use `--connect-timeout`, `--request-timeout`, `--max-ocsp-age`, and
 `--clock-skew` to tune monitoring behavior. Connection timeout defaults to
-2 seconds and request timeout to 60 seconds to allow large CRL downloads to
-finish. `--proxy` and `--no-proxy` apply
+5 seconds, covering the entire initial TLS handshake. Request timeout defaults
+to 60 seconds to allow large CRL downloads to finish. `--proxy` and `--no-proxy` apply
 to CRL and OCSP HTTP requests; direct TLS certificate retrieval is not routed
 through an HTTP proxy.
 
@@ -407,6 +410,13 @@ gets its own retries. Without this, a
 single transient CRL/OCSP failure for a certificate that has no other usable
 revocation source would surface as `REVOCATION: UNKNOWN` even though the
 certificate itself is fine.
+
+Timeouts apply per attempt, not per domain. With the default six retries,
+seven timed-out TLS attempts plus backoff take about 51 seconds; seven
+timed-out HTTP requests plus backoff take about 7 minutes 16 seconds for one
+object. Verification, other objects, and shared-cache lock waits can add time.
+There is no overall per-domain deadline; use `--connect-retries` to reduce
+the retry budget when faster failure reporting is needed.
 
 Curl and wget both use one client attempt per retry. Wget applies
 `--connect-timeout` to DNS/connect operations, `--request-timeout` to reads,
@@ -520,6 +530,8 @@ reuse, persistent hits during HTTP outages, TTL and CRL freshness, invalid
 signatures/issuers, safe file publishing, slow shared downloads, and lock reuse.
 JSON assertions
 use `jq`. IPv6 connections are tested when loopback IPv6 is available.
+CAA regressions simulate `dig`, `host`, and `nslookup` replies and stalled
+lookups, checking deadlines, advisory warnings, and unchanged trust results.
 The OCSP suite uses a BusyBox CGI responder to sign real requests with a
 disposable CA, counts HTTP requests, and tests cache identity isolation,
 signature/freshness rejection, missing `nextUpdate`, and revoked intermediates.

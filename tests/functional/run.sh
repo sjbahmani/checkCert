@@ -47,7 +47,7 @@ start_server() {
     local key="${cert/\/certs\//\/private\/}"
     key="${key%.pem}.key"
     [[ "$bind_host" == *:* ]] && bind_host="[$bind_host]"
-    local -a args=(-accept "$bind_host:$port" -cert "$cert" -key "$key" -naccept 100 -quiet)
+    local -a args=(-accept "$bind_host:$port" -cert "$cert" -key "$key" -naccept 200 -quiet)
     [[ -n "$chain" ]] && args+=(-cert_chain "$chain")
     openssl s_server "${args[@]}" >"$PKI_DIR/s_server-$port.log" 2>&1 &
     pids+=($!)
@@ -380,6 +380,63 @@ else
     echo 'SKIP: IPv6 backend checks (IPv6 loopback unavailable).'
 fi
 
+# CAA replies are mocked, while TLS and revocation still use the local PKI.
+mkdir "$PKI_DIR/caa-bin"
+for resolver in dig host nslookup; do
+    cp "$script_dir/caa_fixture.sh" "$PKI_DIR/caa-bin/$resolver"
+    chmod +x "$PKI_DIR/caa-bin/$resolver"
+done
+with_caa_resolver() (
+    export CHECKCRT_CAA_RESOLVER=$1
+    shift
+    # Hide earlier resolver choices so each fallback is exercised even when
+    # the machine has all three DNS tools installed.
+    # shellcheck disable=SC2329
+    command() {
+        if [[ "${1:-}" == -v && "${2:-}" =~ ^(dig|host|nslookup)$ && "$2" != "$CHECKCRT_CAA_RESOLVER" ]]; then return 1; fi
+        builtin command "$@"
+    }
+    export -f command
+    "$@"
+)
+for resolver in dig host nslookup; do
+    for mode in records nodata servfail nxdomain empty failure timeout; do
+        check_exit "CAA $resolver $mode leaves valid certificate status unchanged" 0 \
+            with_caa_resolver "$resolver" env PATH="$PKI_DIR/caa-bin:$PATH" CHECKCRT_CAA_MODE="$mode" \
+            "$check" --no-cache --connect-retries 0 --connect-ip 127.0.0.1 --json \
+            --ca-file "$PKI_DIR/certs/root.pem" backend.test "$GOOD_PORT"
+        assert_output "CAA $resolver $mode preserves JSON trust and revocation" \
+            json_matches '.[0].trust == "TRUSTED" and .[0].revocation == "NOT REVOKED"' /tmp/functest.out
+        case "$mode" in
+            records)
+                assert_output "CAA $resolver reports the record" grep -q '0 issue "ca.example"' /tmp/functest.err
+                assert_output "CAA $resolver record has no lookup warning" \
+                    json_matches 'all(.[0].warnings[]; startswith("CAA lookup") | not)' /tmp/functest.out
+                ;;
+            nodata)
+                assert_output "CAA $resolver recognizes successful empty answer" \
+                    grep -q 'no CAA record found.*inherited policy not checked' /tmp/functest.err
+                assert_output "CAA $resolver empty answer has no lookup warning" \
+                    json_matches 'all(.[0].warnings[]; startswith("CAA lookup") | not)' /tmp/functest.out
+                ;;
+            *)
+                assert_output "CAA $resolver $mode reports unknown" grep -q 'CAA status: UNKNOWN' /tmp/functest.err
+                assert_output "CAA $resolver $mode is included in JSON warnings" \
+                    json_matches 'any(.[0].warnings[]; startswith("CAA lookup for backend.test:"))' /tmp/functest.out
+                # Expand $1 in the inner Bash process, not in this test runner.
+                # shellcheck disable=SC2016
+                assert_output "CAA $resolver $mode never reports missing records" \
+                    bash -c '! grep -q "no CAA record found\|CAA record(s) at" "$1"' _ /tmp/functest.err
+                if [[ "$mode" == timeout ]]; then
+                    assert_output "CAA $resolver deadline interrupts the 20-second resolver" \
+                        json_matches '.[0].elapsed_seconds >= 5 and .[0].elapsed_seconds < 12' /tmp/functest.out
+                    assert_output "CAA $resolver explains timeout" grep -q 'lookup timed out (5-second deadline)' /tmp/functest.err
+                fi
+                ;;
+        esac
+    done
+done
+
 # Count real HTTP requests, rather than trusting cache diagnostic messages.
 # The wrapper still calls the actual client against the local HTTP fixture.
 if command -v curl >/dev/null 2>&1; then cache_client=curl; else cache_client=wget; fi
@@ -492,7 +549,7 @@ if command -v wget >/dev/null; then
     assert_output "wget timeout stops before delayed downloads finish" \
         json_matches '.[0].elapsed_seconds < 6' /tmp/functest.out
     assert_output "wget has no nested retry loop" grep -Fxq -- '--tries=1' "$PKI_DIR/wget.args"
-    assert_output "wget obeys the connection timeout" grep -Fxq -- '--connect-timeout=2' "$PKI_DIR/wget.args"
+    assert_output "wget obeys the connection timeout" grep -Fxq -- '--connect-timeout=5' "$PKI_DIR/wget.args"
     assert_output "wget uses the request timeout for reads" grep -Fxq -- '--read-timeout=1' "$PKI_DIR/wget.args"
 fi
 

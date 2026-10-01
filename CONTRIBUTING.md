@@ -33,7 +33,9 @@ errors — CI fails on warnings too).
   fallback, and `--hosts-file` batch mode (both sequential and parallel),
   asserting exit codes and specific output. Cache tests count actual CRL/AIA
   downloads through `fetch_wrapper.sh` and exercise freshness, signature
-  verification, outages, and parallel reuse. The entry point also runs
+  verification, outages, and parallel reuse. CAA fixtures exercise all three
+  DNS tools, lookup deadlines, and advisory failures without public DNS queries.
+  The entry point also runs
   `ocsp_cache.sh`, which can be run independently with Bash and uses a local
   CGI responder to test signed OCSP responses and count actual HTTP requests.
   It also runs `aia_chain.sh` for recursive issuer recovery, cross-signed
