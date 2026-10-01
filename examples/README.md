@@ -20,8 +20,9 @@ SHA-256 fingerprint:
 
 A sample `--hosts-file` grouped by category, including banking, payments and
 fintech (with API, gateway, and portal hosts), capital markets and brokerages,
-marketplaces, telecoms, crypto, cloud, domain registration,
-government, media, and messaging, with `google.com` and `msn.com` as
+marketplaces, travel, app stores, maps, telecoms, crypto, cloud, domain registration,
+government, health and insurance, education, utilities and postal tracking,
+media, and messaging, with `google.com` and `msn.com` as
 non-Iranian baselines.
 Each category is sorted by domain, with subdomains immediately after their
 parent domain when listed. Commented-out hosts remain disabled. Pair it with

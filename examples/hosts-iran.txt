@@ -128,18 +128,39 @@ www.emofid.com
 mofidonline.com
 sejam.ir
 
-# Marketplace / ride-hailing / e-commerce
+# Marketplace / ride-hailing / e-commerce / food
+basalam.com
+wallet.basalam.com
 digikala.com
 divar.ir
+www.sheypoor.com
 snapp.ir
+snapp.market
+snappfood.ir
 tapsi.ir
 torob.com
 
+# Travel / tickets / accommodation
+www.alibaba.ir
+www.raja.ir
+www.snapptrip.com
+
+# App stores
+cafebazaar.ir
+myket.ir
+
+# Maps / navigation
+balad.ir
+neshan.org
+
 # Telecom
 irancell.ir
+my.irancell.ir
 mci.ir
+my.mci.ir
 shatel.ir
 register.shatel.ir
+my.tci.ir
 
 # Crypto exchanges / information
 arzdigital.com
@@ -161,22 +182,43 @@ nic.ir
 
 # Government
 adliran.ir
+eblagh.adliran.ir
 behdasht.gov.ir
 cbi.ir
 dolat.ir
 eadl.ir
+sakha.epolice.ir
 intamedia.ir
 iran.gov.ir
 irica.gov.ir
 irica.ir
+hemayat.mcls.gov.ir
 my.medu.ir
 mfa.ir
 sso.my.gov.ir
 ntsw.ir
 www.parliran.ir
 president.ir
-tamin.ir
+my.ssaa.ir
 tax.gov.ir
+my.tax.gov.ir
+
+# Health / insurance / appointments
+doctoreto.com
+csp.ihio.gov.ir
+www.paziresh24.com
+tamin.ir
+ep.tamin.ir
+es.tamin.ir
+nobat.tamin.ir
+
+# Education / admissions
+my.sanjesh.org
+www.sanjesh.org
+
+# Utilities / postal tracking
+bargheman.com
+tracking.post.ir
 
 # Media / news
 aparat.com
