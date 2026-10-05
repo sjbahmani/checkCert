@@ -49,7 +49,6 @@ mellat.ir
 ebanking.mellat.ir
 karafarinbnk.ir
 hibank.ir
-
 middleeastbank.ir
 ib.middleeastbank.ir
 omidbank.ir
