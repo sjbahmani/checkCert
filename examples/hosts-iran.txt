@@ -49,6 +49,7 @@ ebanking.mellat.ir
 middleeastbank.ir
 omidbank.ir
 parsian-bank.ir
+ipb.parsian-bank.ir
 postbank.ir
 rb24.ir
 ib.rb24.ir
