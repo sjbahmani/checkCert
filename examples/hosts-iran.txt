@@ -18,6 +18,7 @@ baambank.ir
 bank-day.ir
 ebank.bank-day.ir
 bank-keshavarzi.com
+ib.bank-keshavarzi.com
 bank-maskan.ir
 ibn.bank-maskan.ir
 bank-melli.ir
