@@ -121,6 +121,7 @@ payment.zarinpal.com
 zibal.ir
 gateway.zibal.ir
 panel.zibal.ir
+top.ir
 
 # Capital markets
 online.agah.com
