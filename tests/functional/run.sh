@@ -30,6 +30,7 @@ OCSP_PURPOSE_PORT=8995
 SNI_PORT=8996
 IPV6_PORT=8997
 CROSS_PORT=8998
+STAPLED_PORT=8999
 
 export HTTPPORT
 PKI_DIR=$(bash "$script_dir/setup_pki.sh")
@@ -43,12 +44,13 @@ cleanup() {
 trap cleanup EXIT
 
 start_server() {
-    local port=$1 cert=$2 chain=${3:-} bind_host=${4:-127.0.0.1}
+    local port=$1 cert=$2 chain=${3:-} bind_host=${4:-127.0.0.1} staple=${5:-}
     local key="${cert/\/certs\//\/private\/}"
     key="${key%.pem}.key"
     [[ "$bind_host" == *:* ]] && bind_host="[$bind_host]"
     local -a args=(-accept "$bind_host:$port" -cert "$cert" -key "$key" -naccept 200 -quiet)
     [[ -n "$chain" ]] && args+=(-cert_chain "$chain")
+    [[ -n "$staple" ]] && args+=(-status_file "$staple")
     openssl s_server "${args[@]}" >"$PKI_DIR/s_server-$port.log" 2>&1 &
     pids+=($!)
 }
@@ -59,6 +61,19 @@ pids+=("$!")
 # leaf-good served with its full chain (intermediate)
 start_server "$GOOD_PORT" "$PKI_DIR/certs/leaf-good.pem" "$PKI_DIR/chain-good.pem"
 start_server "$CROSS_PORT" "$PKI_DIR/certs/leaf-good.pem" "$PKI_DIR/chain-cross.pem"
+# Include the delegated signer's certificate in a real stapled response.
+# s_client prints that PEM before the Certificate chain section.
+if ! openssl ocsp -issuer "$PKI_DIR/certs/intermediate.pem" \
+    -cert "$PKI_DIR/certs/leaf-good.pem" -index "$PKI_DIR/ca/index.txt" \
+    -rsigner "$PKI_DIR/certs/leaf-ocsp-purpose.pem" \
+    -rkey "$PKI_DIR/private/leaf-ocsp-purpose.key" \
+    -CA "$PKI_DIR/certs/intermediate.pem" -ndays 1 \
+    -respout "$PKI_DIR/stapled.der" >"$PKI_DIR/stapled.log" 2>&1; then
+    echo "FAIL: could not generate stapled OCSP fixture" >&2
+    exit 1
+fi
+start_server "$STAPLED_PORT" "$PKI_DIR/certs/leaf-good.pem" "$PKI_DIR/chain-good.pem" \
+    127.0.0.1 "$PKI_DIR/stapled.der"
 # leaf-revoked served with its full chain
 start_server "$REVOKED_PORT" "$PKI_DIR/certs/leaf-revoked.pem" "$PKI_DIR/chain-good.pem"
 # leaf3 served with its full chain (intermediate2 + root) — intermediate2 gets revoked
@@ -78,7 +93,7 @@ pids+=("$!")
 start_server "$IPV6_PORT" "$PKI_DIR/certs/leaf-good.pem" "$PKI_DIR/chain-good.pem" ::1
 
 sleep 1
-for p in "$HTTPPORT" "$GOOD_PORT" "$REVOKED_PORT" "$LEAF3_PORT" "$AIA_PORT" "$OCSP_PURPOSE_PORT" "$SNI_PORT" "$CROSS_PORT"; do
+for p in "$HTTPPORT" "$GOOD_PORT" "$REVOKED_PORT" "$LEAF3_PORT" "$AIA_PORT" "$OCSP_PURPOSE_PORT" "$SNI_PORT" "$CROSS_PORT" "$STAPLED_PORT"; do
     timeout 3 bash -c "echo > /dev/tcp/127.0.0.1/$p" 2>/dev/null || {
         echo "FAIL: server on port $p did not come up" >&2
         exit 1
@@ -131,7 +146,7 @@ check_exit "leaf-good served alone (no chain): AIA-recovered issuer -> VALID" 0 
 # of -status, so the retry fires, detects it's still wrong, and correctly
 # falls back to reporting an untrusted/invalid-purpose result (exit 5) —
 # this exercises the retry code path without requiring a server that
-# actually changes certs based on OCSP-stapling requests, as msn.com's does.
+# changes certs based on OCSP-stapling requests.
 check_exit "leaf-ocsp-purpose: wrong EKU triggers retry, still wrong -> exit 5" 5 \
     "$check" --ca-file "$PKI_DIR/certs/root.pem" 127.0.0.1 "$OCSP_PURPOSE_PORT"
 if grep -q "unexpected purpose" /tmp/functest.out && grep -q "still returned an unexpected certificate purpose" /tmp/functest.err; then
@@ -197,6 +212,22 @@ assert_output() {
 json_matches() {
     jq -e -s "$1" "$2" >/dev/null
 }
+
+check_exit "embedded OCSP signer does not replace the TLS leaf" 0 \
+    "$check" --json --no-caa --ca-file "$PKI_DIR/certs/root.pem" 127.0.0.1 "$STAPLED_PORT"
+assert_output "staple retained without wrong-purpose fallback" json_matches \
+    'length == 1 and .[0].overall == "VALID" and .[0].trust == "TRUSTED" and
+     .[0].stapled_ocsp == "PRESENT/GOOD (UNVERIFIED)" and
+     (.[0].warnings | all(.[]; contains("wrong purpose") | not))' /tmp/functest.out
+assert_output "website certificate displayed instead of OCSP signer" \
+    grep -q '^subject=CN=leaf-good.test$' /tmp/functest.err
+check_exit "stapled response does not bypass actual hostname mismatch" 5 \
+    "$check" --json --no-caa --ca-file "$PKI_DIR/certs/root.pem" \
+    --connect-ip 127.0.0.1 wrong.test "$STAPLED_PORT"
+assert_output "hostname mismatch preserves staple and invalid trust" json_matches \
+    '.[0].trust == "UNTRUSTED/INVALID" and
+     (.[0].reason | contains("wrong.test")) and
+     .[0].stapled_ocsp == "PRESENT/GOOD (UNVERIFIED)"' /tmp/functest.out
 
 same_final_status() {
     diff -u <(sed '/^  ELAPSED:/d' "$1") <(sed '/^  ELAPSED:/d' "$2")

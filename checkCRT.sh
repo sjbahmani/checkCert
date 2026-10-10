@@ -9,7 +9,7 @@
 
 set -u -o pipefail
 
-VERSION=1.19.0
+VERSION=1.19.1
 verify_peer=1
 ca_file=
 ca_path=
@@ -954,6 +954,23 @@ check_certificate_revocation() {
     rc_ocsp_good=$ocsp_good_local
 }
 
+# s_client -status may print an OCSP signer's PEM before the server chain.
+# Only the explicitly delimited chain contains the peer's TLS certificates.
+extract_peer_chain() {
+    local transcript=$1 output_dir=$2
+    awk -v output_dir="$output_dir" '
+        /^Certificate chain[[:space:]]*$/ { in_chain=1; next }
+        !in_chain { next }
+        /^---[[:space:]]*$/ { exit }
+        /^-----BEGIN CERTIFICATE-----[[:space:]]*$/ {
+            number++; file=output_dir "/cert-" number ".pem"; writing=1
+        }
+        writing { print > file }
+        /^-----END CERTIFICATE-----[[:space:]]*$/ { close(file); writing=0 }
+        END { if (!number || writing) exit 1 }
+    ' "$transcript"
+}
+
 # Runs the full check for one host:port and returns the exit code (does not
 # call exit itself, so --hosts-file can check many hosts in one process).
 check_host_details() {
@@ -1048,11 +1065,7 @@ check_host_details() {
         emit_error_json "$domain" "$port" "unable to connect, negotiate STARTTLS, or retrieve the certificate chain"
         return 3
     fi
-    if ! awk -v output_dir="$host_workdir" '
-            /-----BEGIN CERTIFICATE-----/ { number++; file=output_dir "/cert-" number ".pem"; writing=1 }
-            writing { print > file }
-            /-----END CERTIFICATE-----/ { close(file); writing=0 }
-        ' "$host_workdir/s_client.txt"; then
+    if ! extract_peer_chain "$host_workdir/s_client.txt" "$host_workdir"; then
         echo "Error: unable to connect or retrieve the certificate chain." >&2
         emit_error_json "$domain" "$port" "unable to connect or retrieve the certificate chain"
         return 3
@@ -1070,23 +1083,16 @@ check_host_details() {
         return 3
     fi
 
-    # Some servers/load balancers misroute connections that request OCSP
-    # stapling (the -status flag above) to an unrelated backend -- e.g. an
-    # OCSP responder answering with its own signing certificate instead of
-    # the real TLS server certificate. That cert has no serverAuth EKU and
-    # cannot possibly match the hostname, so retry once without requesting
-    # stapling before treating the result as a genuine trust failure.
+    # Preserve the fallback for a peer chain whose actual leaf has the wrong
+    # purpose. OCSP signer certificates outside that chain are ignored above.
+    # The retried chain must still pass all normal trust and identity checks.
     leaf_eku=$(openssl x509 -in "$leaf" -noout -ext extendedKeyUsage 2>/dev/null)
     if [[ -n "$leaf_eku" ]] && ! grep -q 'TLS Web Server Authentication' <<<"$leaf_eku"; then
         echo "Certificate has an unexpected purpose (no TLS Web Server Authentication); retrying without requesting OCSP stapling ..."
         retry_workdir=$(mktemp -d "$host_workdir/retry.XXXXXX")
         if timeout "$connect_timeout" openssl s_client -connect "$connect_target" "${sni_args[@]}" \
                 "${starttls_args[@]}" -showcerts </dev/null >"$retry_workdir/s_client.txt" 2>/dev/null \
-            && awk -v output_dir="$retry_workdir" '
-                    /-----BEGIN CERTIFICATE-----/ { number++; file=output_dir "/cert-" number ".pem"; writing=1 }
-                    writing { print > file }
-                    /-----END CERTIFICATE-----/ { close(file); writing=0 }
-                ' "$retry_workdir/s_client.txt" \
+            && extract_peer_chain "$retry_workdir/s_client.txt" "$retry_workdir" \
             && [[ -s "$retry_workdir/cert-1.pem" ]] \
             && openssl x509 -in "$retry_workdir/cert-1.pem" -noout >/dev/null 2>&1
         then

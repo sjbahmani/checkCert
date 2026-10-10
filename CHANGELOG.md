@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.19.1
+
+- Extract TLS certificates only from OpenSSL's Certificate chain section.
+  Embedded OCSP signer certificates no longer cause false hostname/purpose
+  failures, incorrect expiry reporting, or unnecessary fallback connections.
+  Preserve stapled OCSP reporting and normal trust and hostname verification.
+
 ## 1.19.0
 
 - Switch timed-out direct CRL/AIA downloads to optional `axel -n 10` for

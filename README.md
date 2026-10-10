@@ -365,12 +365,11 @@ the raw staple for independent signature verification. The direct OCSP query
 or its reverified, still-current cached response supplies verified OCSP evidence.
 
 The script always requests OCSP stapling (the TLS `status_request` extension)
-so it can report `STAPLED OCSP`. A few servers/load balancers misroute
-connections that request it to an unrelated backend — e.g. an internal OCSP
-responder answering with its own signing certificate instead of the real
-site certificate (observed on `msn.com` from some network paths). When the
-received leaf has an `extendedKeyUsage` that excludes TLS Web Server
-Authentication, the script automatically retries once without requesting
+so it can report `STAPLED OCSP`. It extracts TLS certificates only from
+OpenSSL's `Certificate chain` section: OCSP signer certificates printed before
+that section are not website certificates and do not affect hostname or expiry
+checks. When the actual server leaf has an `extendedKeyUsage` that excludes
+TLS Web Server Authentication, the script automatically retries once without requesting
 stapling; if that retry comes back with a normal server certificate, it's
 used for the rest of the check, `STAPLED OCSP` is skipped for that host (it
 wasn't requested on the retry), and an `ADVISORY WARNINGS` entry records
