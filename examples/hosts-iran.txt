@@ -196,6 +196,7 @@ adliran.ir
 eblagh.adliran.ir
 behdasht.gov.ir
 cbi.ir
+pki.cbi.ir
 dolat.ir
 eadl.ir
 sakha.epolice.ir
@@ -255,3 +256,8 @@ web.splus.ir
 # Baselines (non-Iranian, for comparison)
 google.com
 msn.com
+
+
+# Education
+edu.sharif.edu
+ut.ac.ir
